@@ -1,0 +1,1 @@
+# Reads the sys args on whether to launch pretrain generation or sft generation and validates args from explicit config.

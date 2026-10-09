@@ -1,0 +1,21 @@
+model: "your-huggingface-model-id"
+
+generation:
+  total_tokens: 1_000_000_000
+  max_ctx: 256_0000
+  model_weight_overhead: null       # REQUIRED: GiB of fixed model/runtime VRAM
+  model_max_ctx_overhead: null      # REQUIRED: GiB of KV memory at max_ctx tokens
+
+inference:
+  max_gpu_memory_utilization: 0.90
+  max_model_len: 4096               # REQUIRED: per-request context limit
+  args:
+    max_tokens: 2000                # REQUIRED: per-request output maximum
+    temperature: 0.8
+    top_p: 0.95
+    thinking: false
+
+storage:
+  path: "./output"
+  characters_per_file: 150_000
+  characters_to_generate: 300_000

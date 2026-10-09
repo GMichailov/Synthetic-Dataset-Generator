@@ -1,11 +1,11 @@
 import ast
 import asyncio
 import inspect
-import sys
-import types
 from types import SimpleNamespace
 
 import pytest
+from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.v1.engine.async_llm import AsyncLLM
 
 from src.pretraining import inference
 from src.pretraining.inference import (
@@ -59,87 +59,25 @@ class FakeEngine:
         yield _make_output(self.text, self.token_count)
 
 
-def _module(name, **attrs):
-    module = types.ModuleType(name)
-    for key, value in attrs.items():
-        setattr(module, key, value)
-    return module
-
-
-def _package(name):
-    module = types.ModuleType(name)
-    module.__path__ = []
-    return module
-
-
 @pytest.fixture
 def vllm_stub(monkeypatch):
     captured = SimpleNamespace(
-        engine_kwargs=[],
-        sampling_kwargs=[],
+        engine_args=[],
+        sampling_params=[],
         factory=None,
         start_calls=0,
     )
-
-    class FakeRequestOutputKind:
-        CUMULATIVE = "cumulative"
-        DELTA = "delta"
-        FINAL_ONLY = "final_only"
-
-    class FakeSamplingParams:
-        def __init__(self, **kwargs):
-            captured.sampling_kwargs.append(dict(kwargs))
-            self.kwargs = kwargs
-
-    class FakeChatParams:
-        def __init__(
-            self,
-            chat_template=None,
-            chat_template_content_format="auto",
-            chat_template_kwargs=None,
-            **kwargs,
-        ):
-            self.chat_template = chat_template
-            self.chat_template_content_format = chat_template_content_format
-            self.chat_template_kwargs = dict(chat_template_kwargs or {})
-            self.extra = kwargs
-
-    class FakeAsyncEngineArgs:
-        def __init__(self, **kwargs):
-            captured.engine_kwargs.append(dict(kwargs))
-            self.kwargs = kwargs
 
     class FakeAsyncLLM:
         @classmethod
         def from_engine_args(cls, engine_args, **kwargs):
             captured.start_calls += 1
+            captured.engine_args.append(engine_args)
             if captured.factory is not None:
                 return captured.factory(engine_args)
             return FakeEngine()
 
-    modules = {
-        "vllm": _package("vllm"),
-        "vllm.engine": _package("vllm.engine"),
-        "vllm.engine.arg_utils": _module(
-            "vllm.engine.arg_utils", AsyncEngineArgs=FakeAsyncEngineArgs
-        ),
-        "vllm.v1": _package("vllm.v1"),
-        "vllm.v1.engine": _package("vllm.v1.engine"),
-        "vllm.v1.engine.async_llm": _module(
-            "vllm.v1.engine.async_llm", AsyncLLM=FakeAsyncLLM
-        ),
-        "vllm.sampling_params": _module(
-            "vllm.sampling_params",
-            SamplingParams=FakeSamplingParams,
-            RequestOutputKind=FakeRequestOutputKind,
-        ),
-        "vllm.renderers": _package("vllm.renderers"),
-        "vllm.renderers.params": _module(
-            "vllm.renderers.params", ChatParams=FakeChatParams
-        ),
-    }
-    for name, module in modules.items():
-        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(AsyncLLM, "from_engine_args", FakeAsyncLLM.from_engine_args)
     return captured
 
 
@@ -199,15 +137,15 @@ class TestEngineConfiguration:
 
         asyncio.run(scenario())
 
-        assert len(vllm_stub.engine_kwargs) == 1
-        kwargs = vllm_stub.engine_kwargs[0]
-        assert kwargs["model"] == "test/model"
-        assert kwargs["gpu_memory_utilization"] == pytest.approx(0.90)
-        assert kwargs["max_model_len"] == 4096
-        assert kwargs["max_num_seqs"] == 5
-        assert kwargs["enable_prefix_caching"] is True
-        assert kwargs["disable_log_stats"] is True
-        assert kwargs["use_tqdm_on_load"] is False
+        assert len(vllm_stub.engine_args) == 1
+        engine_args = vllm_stub.engine_args[0]
+        assert engine_args.model == "test/model"
+        assert engine_args.gpu_memory_utilization == pytest.approx(0.90)
+        assert engine_args.max_model_len == 4096
+        assert engine_args.max_num_seqs == 5
+        assert engine_args.enable_prefix_caching is True
+        assert engine_args.disable_log_stats is True
+        assert engine_args.use_tqdm_on_load is False
 
     def test_max_num_seqs_never_exceeds_estimate(self, vllm_stub):
         async def scenario():
@@ -216,7 +154,7 @@ class TestEngineConfiguration:
             await manager.shutdown()
 
         asyncio.run(scenario())
-        assert vllm_stub.engine_kwargs[0]["max_num_seqs"] == 3
+        assert vllm_stub.engine_args[0].max_num_seqs == 3
 
     def test_start_rejects_nonpositive_concurrency(self, vllm_stub):
         async def scenario():
@@ -225,7 +163,7 @@ class TestEngineConfiguration:
                 await manager.start(0)
 
         asyncio.run(scenario())
-        assert vllm_stub.engine_kwargs == []
+        assert vllm_stub.engine_args == []
 
     def test_engine_created_once(self, vllm_stub):
         engine = FakeEngine(chat_template=None)
@@ -257,15 +195,16 @@ class TestSamplingParams:
         async def scenario():
             manager = InferenceManager(make_config())
             await manager.start(2)
+            params = manager._sampling_params
             await manager.shutdown()
+            return params
 
-        asyncio.run(scenario())
-        assert vllm_stub.sampling_kwargs[0] == {
-            "max_tokens": 2000,
-            "temperature": 0.8,
-            "top_p": 0.95,
-            "output_kind": "final_only",
-        }
+        params = asyncio.run(scenario())
+        assert isinstance(params, SamplingParams)
+        assert params.max_tokens == 2000
+        assert params.temperature == 0.8
+        assert params.top_p == 0.95
+        assert params.output_kind == RequestOutputKind.FINAL_ONLY
 
     def test_thinking_never_reaches_sampling_params(self, vllm_stub):
         config = make_config(**{"inference.args.thinking": True})
@@ -273,12 +212,13 @@ class TestSamplingParams:
         async def scenario():
             manager = InferenceManager(config)
             await manager.start(2)
+            params = manager._sampling_params
             await manager.shutdown()
+            return params
 
-        asyncio.run(scenario())
-        kwargs = vllm_stub.sampling_kwargs[0]
-        assert "thinking" not in kwargs
-        assert "enable_thinking" not in kwargs
+        params = asyncio.run(scenario())
+        assert not hasattr(params, "thinking")
+        assert not hasattr(params, "enable_thinking")
 
 
 class TestPromptRendering:

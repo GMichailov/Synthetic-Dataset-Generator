@@ -17,12 +17,23 @@ from typing import Any
 import yaml
 from rich.console import Console, Group
 from rich.live import Live
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    TextColumn,
+    TimeElapsedColumn,
+)
 from rich.table import Table
 from rich.text import Text
 
 from .dataloader import TopicLoader
 from .inference import BenchmarkMeasurement, InferenceManager
-from .nvidia_generation import CapacityReport, estimate_capacity
+from .nvidia_generation import (
+    CapacityReport,
+    estimate_capacity,
+    resolve_model_path,
+)
 from .writer import TextWriter, WriteStats
 
 logger = logging.getLogger(__name__)
@@ -52,27 +63,10 @@ class _RunState:
     interrupted: bool = False
     started_at: float = field(default_factory=time.monotonic)
     stop_event: asyncio.Event = field(default_factory=asyncio.Event)
-    crossed_targets: list[str] = field(default_factory=list)
 
-    def note_committed(
-        self,
-        tokens: int,
-        characters: int,
-        token_target: int,
-        character_target: int,
-    ) -> None:
-        crossed = False
-        if tokens >= token_target and "TOKEN_TARGET" not in self.crossed_targets:
-            self.crossed_targets.append("TOKEN_TARGET")
-            crossed = True
-        if (
-            characters >= character_target
-            and "CHARACTER_TARGET" not in self.crossed_targets
-        ):
-            self.crossed_targets.append("CHARACTER_TARGET")
-            crossed = True
-        if crossed:
-            self.status = "stopping — " + " + ".join(self.crossed_targets)
+    def note_committed(self, characters: int, character_target: int) -> None:
+        if characters >= character_target and not self.stop_event.is_set():
+            self.status = "stopping — CHARACTER_TARGET"
             self.stop_event.set()
 
 
@@ -87,19 +81,6 @@ def _positive_int(value: Any, dotted: str) -> int:
         f"{dotted} must be a positive integer, got {value!r}",
     )
     return value
-
-
-def _nonnegative_real(value: Any, dotted: str) -> float:
-    _require(
-        not isinstance(value, bool) and isinstance(value, (int, float)),
-        f"{dotted} must be a nonnegative finite real number, got {value!r}",
-    )
-    number = float(value)
-    _require(
-        math.isfinite(number) and number >= 0,
-        f"{dotted} must be a nonnegative finite real number, got {value!r}",
-    )
-    return number
 
 
 def _validate_config(config: dict) -> None:
@@ -120,6 +101,7 @@ def _validate_config(config: dict) -> None:
         isinstance(model, str) and bool(model.strip()),
         "model must be a nonempty string",
     )
+    resolve_model_path(model)
 
     path = get("storage.path")
     _require(
@@ -128,20 +110,50 @@ def _validate_config(config: dict) -> None:
     )
 
     for dotted in (
-        "generation.total_tokens",
-        "generation.max_ctx",
-        "inference.max_model_len",
+        "inference.context_length",
+        "inference.port",
         "inference.args.max_tokens",
         "storage.characters_per_file",
         "storage.characters_to_generate",
     ):
         _positive_int(get(dotted), dotted)
 
-    for dotted in (
-        "generation.model_weight_overhead",
-        "generation.model_max_ctx_overhead",
-    ):
-        _nonnegative_real(get(dotted), dotted)
+    port = get("inference.port")
+    _require(
+        port <= 65535,
+        f"inference.port must be at most 65535, got {port}",
+    )
+
+    kv_bytes_per_token = get("inference.kv_bytes_per_token")
+    _require(
+        not isinstance(kv_bytes_per_token, bool)
+        and isinstance(kv_bytes_per_token, (int, float))
+        and math.isfinite(kv_bytes_per_token)
+        and kv_bytes_per_token > 0,
+        "inference.kv_bytes_per_token must be a positive finite number, "
+        f"got {kv_bytes_per_token!r}",
+    )
+
+    server_command = get("inference.server_command")
+    _require(
+        (isinstance(server_command, str) and bool(server_command.strip()))
+        or (
+            isinstance(server_command, list)
+            and bool(server_command)
+            and all(
+                isinstance(part, str) and bool(part) for part in server_command
+            )
+        ),
+        "inference.server_command must be a nonempty string or a nonempty "
+        "list of strings",
+    )
+
+    extra_args = get("inference.extra_args")
+    _require(
+        isinstance(extra_args, list)
+        and all(isinstance(arg, str) for arg in extra_args),
+        f"inference.extra_args must be a list of strings, got {extra_args!r}",
+    )
 
     utilization = get("inference.max_gpu_memory_utilization")
     _require(
@@ -178,10 +190,10 @@ def _validate_config(config: dict) -> None:
     )
 
     max_tokens = get("inference.args.max_tokens")
-    max_model_len = get("inference.max_model_len")
+    context_length = get("inference.context_length")
     _require(
-        max_tokens < max_model_len,
-        "inference.args.max_tokens must be less than inference.max_model_len",
+        max_tokens < context_length,
+        "inference.args.max_tokens must be less than inference.context_length",
     )
 
 
@@ -198,14 +210,9 @@ def load_config(path: str = "config.yaml") -> dict:
 def _select_concurrency(measurements: list[BenchmarkMeasurement]) -> int:
     if not measurements:
         raise RuntimeError("benchmark returned no measurements")
-    best = max(m.output_tokens_per_second for m in measurements)
-    threshold = 0.95 * best
-    eligible = [
-        m.concurrency
-        for m in measurements
-        if m.output_tokens_per_second >= threshold
-    ]
-    return min(eligible)
+    return max(
+        measurements, key=lambda m: m.output_tokens_per_second
+    ).concurrency
 
 
 def _print_capacity_summary(config: dict, report: CapacityReport) -> None:
@@ -217,16 +224,16 @@ def _print_capacity_summary(config: dict, report: CapacityReport) -> None:
         f"({report.allowed_vram_bytes / _GIB:.2f} GiB allowed)"
     )
     console.print(
-        f"  Fixed model overhead:     {report.fixed_overhead_bytes / _GIB:.2f} GiB"
+        f"  Model weights (GGUF):     {report.model_weights_bytes / _GIB:.2f} GiB"
     )
     console.print(
         f"  KV per cached token:      {report.kv_bytes_per_token:.2f} bytes"
     )
     console.print(
-        f"  Worst-case sequence:      {report.worst_case_tokens_per_sequence} tokens"
+        f"  Context per request:      {report.per_request_context_tokens} tokens"
     )
     console.print(
-        f"  Conservative concurrency: {report.estimated_concurrency}"
+        f"  Server slots (-np):       {report.estimated_concurrency}"
     )
 
 
@@ -246,6 +253,34 @@ def _print_benchmark_table(measurements: list[BenchmarkMeasurement]) -> None:
             f"{measurement.elapsed_seconds:.2f}",
         )
     console.print(table)
+
+
+def _print_timeframe_estimate(
+    config: dict,
+    measurements: list[BenchmarkMeasurement],
+    selected_concurrency: int,
+) -> None:
+    measurement = next(
+        m for m in measurements if m.concurrency == selected_concurrency
+    )
+    target = config["storage"]["characters_to_generate"]
+    characters_per_second = measurement.total_output_characters / max(
+        measurement.elapsed_seconds, 1e-9
+    )
+    if characters_per_second <= 0:
+        raise RuntimeError(
+            "benchmark measured zero output throughput — the llama serve "
+            "backend is unhealthy"
+        )
+    seconds = target / characters_per_second
+    console.print("[bold]Timeframe estimate[/bold] (no data generated)")
+    console.print(f"  Target characters:         {target:,}")
+    console.print(
+        f"  Measured throughput:       "
+        f"{characters_per_second:,.1f} chars/s "
+        f"(concurrency {selected_concurrency})"
+    )
+    console.print(f"  Estimated generation time: {_format_hms(seconds)}")
 
 
 def _format_hms(seconds: float) -> str:
@@ -374,7 +409,6 @@ async def _writer_consumer(
     result_queue: asyncio.Queue,
     writer: TextWriter,
     state: _RunState,
-    token_target: int,
     character_target: int,
 ) -> None:
     while True:
@@ -386,9 +420,7 @@ async def _writer_consumer(
             writer.append(text, output_tokens)
             snapshot = writer.snapshot()
             state.note_committed(
-                snapshot.output_tokens_appended,
-                snapshot.total_characters_written,
-                token_target,
+                snapshot.generated_characters_appended,
                 character_target,
             )
         finally:
@@ -448,7 +480,6 @@ def _render_dashboard(
     concurrency: int,
     pending: int,
     rate: float,
-    token_target: int,
     character_target: int,
 ) -> Group:
     elapsed = _format_hms(time.monotonic() - state.started_at)
@@ -468,8 +499,8 @@ def _render_dashboard(
     table.add_column("", no_wrap=True)
     table.add_column("", justify="right", no_wrap=True)
     table.add_column("")
-    table.add_row("Output tokens appended:", f"{snapshot.output_tokens_appended:,}", f"/ {token_target:,}")
-    table.add_row("Characters written:", f"{snapshot.total_characters_written:,}", f"/ {character_target:,}")
+    table.add_row("Output tokens appended:", f"{snapshot.output_tokens_appended:,}", "")
+    table.add_row("Characters generated:", f"{snapshot.generated_characters_appended:,}", f"/ {character_target:,}")
     table.add_row("Documents appended:", f"{snapshot.documents_appended:,}", "")
     table.add_row("TXT shards created:", f"{snapshot.files_created:,}", "")
     table.add_row("Aggregate output rate:", f"{rate:,.0f}", "tokens/sec (last 30 s)")
@@ -502,7 +533,6 @@ async def _dashboard(
     model: str,
     gpu_cap: str,
     concurrency: int,
-    token_target: int,
     character_target: int,
 ) -> None:
     history: deque[tuple[float, int]] = deque()
@@ -520,7 +550,6 @@ async def _dashboard(
                         concurrency,
                         job_queue.qsize(),
                         _window_rate(history, snapshot.output_tokens_appended),
-                        token_target,
                         character_target,
                     )
                 )
@@ -548,7 +577,6 @@ async def _run_pipeline(
     inference: InferenceManager,
     concurrency: int,
 ) -> None:
-    token_target = config["generation"]["total_tokens"]
     character_target = config["storage"]["characters_to_generate"]
     queue_max = max(2, 2 * concurrency)
     job_queue: asyncio.Queue = asyncio.Queue(maxsize=queue_max)
@@ -565,9 +593,7 @@ async def _run_pipeline(
         for index in range(concurrency)
     ]
     writer_task = asyncio.create_task(
-        _writer_consumer(
-            result_queue, writer, state, token_target, character_target
-        ),
+        _writer_consumer(result_queue, writer, state, character_target),
         name="writer-consumer",
     )
     dashboard_task = asyncio.create_task(
@@ -578,7 +604,6 @@ async def _run_pipeline(
             config["model"],
             f"{config['inference']['max_gpu_memory_utilization']:.0%}",
             concurrency,
-            token_target,
             character_target,
         ),
         name="dashboard",
@@ -622,18 +647,17 @@ def _print_final_summary(
     console.print("[bold]Generation finished[/bold]")
     console.print(f"  Status:                   {state.status}")
     console.print(
-        f"  Output tokens appended:   {snapshot.output_tokens_appended:,} "
-        f"/ {config['generation']['total_tokens']:,}"
+        f"  Output tokens appended:   {snapshot.output_tokens_appended:,}"
     )
     console.print(
-        f"  Characters written:       {snapshot.total_characters_written:,} "
+        f"  Characters generated:     {snapshot.generated_characters_appended:,} "
         f"/ {config['storage']['characters_to_generate']:,}"
     )
     console.print(f"  Documents appended:       {snapshot.documents_appended:,}")
     console.print(f"  TXT shards created:       {snapshot.files_created:,}")
 
 
-async def run(config: dict) -> None:
+async def run(config: dict, *, timeframe_only: bool = False) -> None:
     _validate_config(config)
 
     rounds = TopicLoader(_PROMPT_DIR).iter_rounds()
@@ -642,10 +666,12 @@ async def run(config: dict) -> None:
         console.print("No prompts found in prompt files; nothing to generate.")
         return
 
-    writer = TextWriter(
-        config["storage"]["path"], config["storage"]["characters_per_file"]
-    )
-    writer.open()
+    writer: TextWriter | None = None
+    if not timeframe_only:
+        writer = TextWriter(
+            config["storage"]["path"], config["storage"]["characters_per_file"]
+        )
+        writer.open()
 
     report = estimate_capacity(config)
     _print_capacity_summary(config, report)
@@ -653,30 +679,63 @@ async def run(config: dict) -> None:
     inference = InferenceManager(config)
     try:
         await inference.start(report.estimated_concurrency)
-        measurements = await inference.benchmark(
-            first_round, report.estimated_concurrency
-        )
+        with Progress(
+            TextColumn("[bold]Benchmark"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as bar:
+            task = bar.add_task("warmup", total=None)
+
+            def on_progress(completed: int, total: int, note: str) -> None:
+                bar.update(task, completed=completed, total=total, description=note)
+
+            measurements = await inference.benchmark(
+                first_round,
+                report.estimated_concurrency,
+                on_progress=on_progress,
+            )
         _print_benchmark_table(measurements)
         selected = _select_concurrency(measurements)
         inference.set_concurrency(selected)
         console.print(f"Selected concurrency: {selected}")
 
+        if timeframe_only:
+            _print_timeframe_estimate(config, measurements, selected)
+            return
+
         await _run_pipeline(
             config, rounds, first_round, writer, inference, selected
         )
     finally:
-        writer.close()
+        if writer is not None:
+            writer.close()
         await inference.shutdown()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate synthetic pretraining data with a local vLLM model."
+        description="Generate synthetic pretraining data with a local "
+        "llama.cpp server (GGUF).",
     )
     parser.add_argument(
         "--config",
         default="config.yaml",
         help="path to the YAML config file (default: config.yaml)",
+    )
+    parser.add_argument(
+        "--timeframe",
+        action="store_true",
+        help="run benchmarks only and print estimated generation time; "
+        "skip data generation",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="port for the llama serve backend (default: inference.port from "
+        "config, 8080)",
     )
     args = parser.parse_args()
 
@@ -692,8 +751,14 @@ def main() -> None:
         print(f"Configuration error: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
 
+    if args.port is not None:
+        if not 1 <= args.port <= 65535:
+            print("--port must be in [1, 65535]", file=sys.stderr)
+            raise SystemExit(2)
+        config["inference"]["port"] = args.port
+
     try:
-        asyncio.run(run(config))
+        asyncio.run(run(config, timeframe_only=args.timeframe))
     except _Interrupted:
         print("Generation interrupted; committed output was preserved.", file=sys.stderr)
         raise SystemExit(130) from None

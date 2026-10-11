@@ -221,12 +221,13 @@ Request lifecycle
 If the vLLM API returns a stream, consume it to the final output (prefer `FINAL_ONLY` output mode when supported). Never append partial chunks to files. On cancellation, abort the vLLM request if the installed API supports it.
 Benchmark (runs before production)
 `benchmark(sample_prompts, max_concurrency)` tests concurrency levels `1, 2, 4, 8, 16, ...` up to `max_concurrency`, including the exact upper bound even if not a power of two.
+After the coarse sweep, refine locally around the measured peak: test levels at `peak ± k * fine_step` (step 2, window ±4) for every in-range level not already tested. This brackets the true throughput maximum on both sides instead of assuming the peak sits on a coarse sample.
 First run a warmup; exclude warmup from throughput measurements.
 For each level, maintain enough outstanding requests to reach the tested concurrency and measure wall-clock duration using a monotonic clock. If there are too few distinct first-round prompts, repeat benchmark-only prompts to keep a meaningful load.
 Collect actual generated output tokens and count completed, not merely submitted, requests. Keep requests long enough for meaningful decode throughput; use the configured generation ceiling unless the benchmark sampling policy intentionally uses a comparable representative length.
 `tok/s = total_output_tokens / elapsed_wall_seconds`, counting only measured benchmark requests. Do not sum individual per-request token/sec.
 Handle a level-specific failure by recording/skipping that level; failure at all levels is fatal. Ensure every request has completed or been cancelled before moving to another level.
-Select the smallest level achieving at least 95% of the maximum measured tokens/sec. This avoids significantly more concurrency for negligible gains.
+Select the level with the highest measured tokens/sec across the coarse and refined levels.
 Set the semaphore limit after the benchmark and before starting production workers. Do not replace an in-use semaphore.
 Benchmark outputs are discarded. They do not call `writer.append()`, consume quotas, or advance prompt rounds.
 Resource behavior and tests

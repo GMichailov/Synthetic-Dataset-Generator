@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 GIB = 2**30
+
+_RUNTIME_OVERHEAD_BYTES = 512 * 2**20
+
+_MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
 
 
 class CapacityError(ValueError):
@@ -15,10 +20,23 @@ class CapacityError(ValueError):
 class CapacityReport:
     total_vram_bytes: int
     allowed_vram_bytes: int
-    fixed_overhead_bytes: int
+    model_weights_bytes: int
     kv_bytes_per_token: float
-    worst_case_tokens_per_sequence: int
+    per_request_context_tokens: int
     estimated_concurrency: int
+
+
+def resolve_model_path(model: str) -> Path:
+    if not isinstance(model, str) or not model.strip():
+        raise CapacityError(f"model must be a nonempty string, got {model!r}")
+    path = Path(model)
+    full = path if path.is_absolute() else _MODELS_DIR / path
+    if not full.is_file():
+        raise CapacityError(
+            f"model file not found: {full} — download the GGUF yourself and "
+            f"place it in {_MODELS_DIR}"
+        )
+    return full
 
 
 def _require(condition: bool, message: str) -> None:
@@ -39,6 +57,12 @@ def _nonnegative_real(value: Any, name: str) -> float:
     _require(math.isfinite(value), f"{name} must be finite, got {value}")
     _require(value >= 0, f"{name} must be nonnegative, got {value}")
     return float(value)
+
+
+def _positive_real(value: Any, name: str) -> float:
+    number = _nonnegative_real(value, name)
+    _require(number > 0, f"{name} must be positive, got {value}")
+    return number
 
 
 def _utilization(value: Any, name: str) -> float:
@@ -74,73 +98,58 @@ def _total_vram_bytes(gpu_index: int) -> int:
 
 
 def estimate_capacity(config: dict, gpu_index: int = 0) -> CapacityReport:
-    generation = config["generation"]
     inference = config["inference"]
     args = inference["args"]
 
-    max_ctx = _positive_int(generation["max_ctx"], "generation.max_ctx")
-    max_model_len = _positive_int(
-        inference["max_model_len"], "inference.max_model_len"
+    context_length = _positive_int(
+        inference["context_length"], "inference.context_length"
     )
     max_tokens = _positive_int(args["max_tokens"], "inference.args.max_tokens")
     _require(
-        max_tokens < max_model_len,
+        max_tokens < context_length,
         f"inference.args.max_tokens ({max_tokens}) must be less than "
-        f"inference.max_model_len ({max_model_len})",
+        f"inference.context_length ({context_length})",
     )
 
     max_gpu_memory_utilization = _utilization(
         inference["max_gpu_memory_utilization"],
         "inference.max_gpu_memory_utilization",
     )
-    model_weight_overhead_gib = _nonnegative_real(
-        generation["model_weight_overhead"], "generation.model_weight_overhead"
-    )
-    model_max_ctx_overhead_gib = _nonnegative_real(
-        generation["model_max_ctx_overhead"], "generation.model_max_ctx_overhead"
+    kv_bytes_per_token = _positive_real(
+        inference["kv_bytes_per_token"], "inference.kv_bytes_per_token"
     )
 
+    model_weights_bytes = resolve_model_path(config["model"]).stat().st_size
     total_vram_bytes = _total_vram_bytes(gpu_index)
 
     allowed_vram = math.floor(total_vram_bytes * max_gpu_memory_utilization)
-    fixed_overhead = math.floor(model_weight_overhead_gib * GIB)
-    kv_bytes_per_token = (model_max_ctx_overhead_gib * GIB) / max_ctx
 
-    _require(
-        kv_bytes_per_token > 0,
-        "generation.model_max_ctx_overhead is zero or too small to yield a "
-        "positive per-token KV budget; zero KV overhead is invalid for "
-        "ordinary KV-caching models",
-    )
+    per_request_kv_bytes = kv_bytes_per_token * context_length
 
-    worst_case_tokens_per_sequence = max_model_len
+    raw_budget = allowed_vram - model_weights_bytes - _RUNTIME_OVERHEAD_BYTES
+    safe_budget = max(0.0, raw_budget * 0.95)
 
-    raw_kv_budget = allowed_vram - fixed_overhead
-    safe_kv_budget = max(0, raw_kv_budget * 0.95)
-
-    estimated_concurrency = math.floor(
-        safe_kv_budget / (kv_bytes_per_token * worst_case_tokens_per_sequence)
-    )
+    estimated_concurrency = math.floor(safe_budget / per_request_kv_bytes)
 
     _require(
         estimated_concurrency >= 1,
-        f"Insufficient memory budget for a single worst-case sequence on GPU "
+        f"Insufficient memory budget for a single full-context request on GPU "
         f"{gpu_index}: total VRAM {total_vram_bytes} bytes, allowed VRAM "
-        f"{allowed_vram} bytes (cap {max_gpu_memory_utilization}), fixed "
-        f"overhead {fixed_overhead} bytes, safe KV budget "
-        f"{safe_kv_budget} bytes, worst-case per-sequence KV "
-        f"{kv_bytes_per_token * worst_case_tokens_per_sequence:.2f} bytes "
-        f"({worst_case_tokens_per_sequence} tokens x "
+        f"{allowed_vram} bytes (cap {max_gpu_memory_utilization}), model "
+        f"weights {model_weights_bytes} bytes, runtime overhead "
+        f"{_RUNTIME_OVERHEAD_BYTES} bytes, safe KV budget "
+        f"{safe_budget} bytes, per-request KV "
+        f"{per_request_kv_bytes:.2f} bytes ({context_length} tokens x "
         f"{kv_bytes_per_token:.2f} bytes/token). Lower "
-        f"generation.model_max_ctx_overhead or raise "
+        f"inference.context_length or inference.kv_bytes_per_token, or raise "
         f"inference.max_gpu_memory_utilization if the GPU supports it.",
     )
 
     return CapacityReport(
         total_vram_bytes=total_vram_bytes,
         allowed_vram_bytes=allowed_vram,
-        fixed_overhead_bytes=fixed_overhead,
+        model_weights_bytes=model_weights_bytes,
         kv_bytes_per_token=kv_bytes_per_token,
-        worst_case_tokens_per_sequence=worst_case_tokens_per_sequence,
+        per_request_context_tokens=context_length,
         estimated_concurrency=estimated_concurrency,
     )

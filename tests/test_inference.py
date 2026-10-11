@@ -1,13 +1,16 @@
 import ast
 import asyncio
+import contextlib
 import inspect
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
-from vllm.sampling_params import RequestOutputKind, SamplingParams
-from vllm.v1.engine.async_llm import AsyncLLM
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 from src.pretraining import inference
+from src.pretraining import nvidia_generation as ng
 from src.pretraining.inference import (
     BenchmarkMeasurement,
     InferenceError,
@@ -15,95 +18,129 @@ from src.pretraining.inference import (
 )
 
 
-def _make_output(text, token_count):
-    return SimpleNamespace(
-        finished=True,
-        outputs=[SimpleNamespace(text=text, token_ids=list(range(token_count)))],
-    )
+class FakeServerProcess:
+    def __init__(self, exit_code=None, stderr_lines=(), terminate_exit_code=-15):
+        self._exit_code = exit_code
+        self.stderr_tail = deque(stderr_lines, maxlen=inference._STDERR_TAIL_LINES)
+        self.terminated = False
+        self.killed = False
+        self._terminate_exit_code = terminate_exit_code
+
+    def poll(self):
+        return self._exit_code
+
+    def terminate(self):
+        self.terminated = True
+        if self._exit_code is None:
+            self._exit_code = self._terminate_exit_code
+
+    def kill(self):
+        self.killed = True
+        if self._exit_code is None:
+            self._exit_code = -9
+
+    def die(self, exit_code=1):
+        self._exit_code = exit_code
 
 
-class FakeRenderer:
-    def __init__(self, chat_template=None):
-        self._tokenizer = SimpleNamespace(chat_template=chat_template)
-        self.chat_calls = []
-
-    def get_tokenizer(self):
-        return self._tokenizer
-
-    def render_chat(self, conversations, chat_params):
-        self.chat_calls.append((conversations, chat_params))
-        rendered = {"type": "token", "prompt": conversations[0][0]["content"]}
-        return list(conversations), [rendered]
-
-
-class FakeEngine:
-    def __init__(self, chat_template=None, text="generated paper", token_count=7):
-        self.renderer = FakeRenderer(chat_template)
-        self.text = text
-        self.token_count = token_count
-        self.shutdown_called = False
+class FakeLlamaBackend:
+    def __init__(self):
         self.requests = []
+        self.active = 0
+        self.peak = 0
+        self.delay = 0.0
+        self.base_delay = 0.0
+        self.comfortable = 10**9
+        self.fail_remaining = 0
+        self.fail_when_active = None
+        self.status = 200
+        self.text = "generated paper"
+        self.token_count = 7
+        self.health_ready = True
+        self.raw_body = None
 
-    def shutdown(self):
-        self.shutdown_called = True
+    def app(self):
+        app = web.Application()
+        app.router.add_get("/health", self._handle_health)
+        app.router.add_post("/v1/chat/completions", self._handle_chat)
+        return app
 
-    async def generate(self, prompt, sampling_params, request_id, **kwargs):
-        self.requests.append(
-            {
-                "prompt": prompt,
-                "sampling_params": sampling_params,
-                "request_id": request_id,
-                "kwargs": kwargs,
-            }
-        )
-        yield _make_output(self.text, self.token_count)
+    async def _handle_health(self, request):
+        if self.health_ready:
+            return web.Response(text="ok")
+        return web.Response(status=503, text="loading")
+
+    async def _handle_chat(self, request):
+        payload = await request.json()
+        self.requests.append(payload)
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        try:
+            delay = self.delay
+            if self.base_delay:
+                delay = self.base_delay * (
+                    1 + max(0, self.active - self.comfortable)
+                )
+            if delay:
+                await asyncio.sleep(delay)
+            if self.fail_when_active is not None and self.peak >= self.fail_when_active:
+                return web.Response(status=500, text="too much concurrency")
+            if self.fail_remaining > 0:
+                self.fail_remaining -= 1
+                return web.Response(status=500, text="injected failure")
+            if self.status != 200:
+                return web.Response(status=self.status, text="backend error")
+            if self.raw_body is not None:
+                return web.json_response(self.raw_body)
+            return web.json_response(
+                {
+                    "choices": [{"message": {"content": self.text}}],
+                    "usage": {"completion_tokens": self.token_count},
+                }
+            )
+        finally:
+            self.active -= 1
 
 
-@pytest.fixture
-def vllm_stub(monkeypatch):
-    captured = SimpleNamespace(
-        engine_args=[],
-        sampling_params=[],
-        factory=None,
-        start_calls=0,
-    )
+@pytest.fixture(autouse=True)
+def models_dir(tmp_path, monkeypatch):
+    models = tmp_path / "models"
+    models.mkdir()
+    (models / "test-model.gguf").write_bytes(b"x" * 1024)
+    monkeypatch.setattr(ng, "_MODELS_DIR", models)
+    return models
 
-    class FakeAsyncLLM:
-        @classmethod
-        def from_engine_args(cls, engine_args, **kwargs):
-            captured.start_calls += 1
-            captured.engine_args.append(engine_args)
-            if captured.factory is not None:
-                return captured.factory(engine_args)
-            return FakeEngine()
 
-    monkeypatch.setattr(AsyncLLM, "from_engine_args", FakeAsyncLLM.from_engine_args)
+@pytest.fixture(autouse=True)
+def spawn_stub(monkeypatch):
+    captured = SimpleNamespace(commands=[], processes=[])
+
+    def fake_spawn(command):
+        captured.commands.append(list(command))
+        process = FakeServerProcess()
+        captured.processes.append(process)
+        return process
+
+    monkeypatch.setattr(inference, "_spawn_server", fake_spawn)
     return captured
 
 
 def make_config(**overrides):
     config = {
-        "model": "test/model",
-        "generation": {
-            "total_tokens": 1_000_000,
-            "max_ctx": 256_000,
-            "model_weight_overhead": 20.0,
-            "model_max_ctx_overhead": 5.0,
-        },
+        "model": "test-model.gguf",
         "inference": {
             "max_gpu_memory_utilization": 0.90,
-            "max_model_len": 4096,
+            "context_length": 4096,
+            "kv_bytes_per_token": 1024.0,
+            "port": 8080,
+            "server_command": ["llama", "serve"],
+            "extra_args": [],
             "args": {
                 "max_tokens": 2000,
                 "temperature": 0.8,
                 "top_p": 0.95,
                 "thinking": False,
             },
-        },
-        "storage": {
-            "path": "./output",
-            "characters_per_file": 150_000,
-            "characters_to_generate": 300_000,
         },
     }
     for dotted_key, value in overrides.items():
@@ -115,6 +152,20 @@ def make_config(**overrides):
     return config
 
 
+@contextlib.asynccontextmanager
+async def running_manager(config, backend, slots=2):
+    server = TestServer(backend.app())
+    await server.start_server()
+    config["inference"]["port"] = server.port
+    manager = InferenceManager(config)
+    await manager.start(slots)
+    try:
+        yield manager, server.port
+    finally:
+        await manager.shutdown()
+        await server.close()
+
+
 class TestBenchmarkMeasurement:
     def test_is_frozen_dataclass(self):
         measurement = BenchmarkMeasurement(
@@ -123,329 +174,394 @@ class TestBenchmarkMeasurement:
             completed_requests=1,
             total_output_tokens=1,
             elapsed_seconds=1.0,
+            total_output_characters=1,
         )
         with pytest.raises(Exception):
             measurement.concurrency = 2
 
 
-class TestEngineConfiguration:
-    def test_start_forwards_cap_context_and_prefix_caching(self, vllm_stub):
+class TestServerCommand:
+    def test_command_matches_expected_flags(self, spawn_stub, models_dir):
+        backend = FakeLlamaBackend()
+
         async def scenario():
-            manager = InferenceManager(make_config())
-            await manager.start(5)
-            await manager.shutdown()
+            async with running_manager(make_config(), backend, slots=3) as (m, port):
+                return port
+
+        port = asyncio.run(scenario())
+        model_path = models_dir / "test-model.gguf"
+        assert spawn_stub.commands == [
+            [
+                "llama",
+                "serve",
+                "-m",
+                str(model_path),
+                "-ngl",
+                "99",
+                "-c",
+                str(4096 * 3),
+                "-np",
+                "3",
+                "-cb",
+                "--cache-type-k",
+                "q4_0",
+                "--cache-type-v",
+                "q4_0",
+                "--port",
+                str(port),
+            ]
+        ]
+
+    def test_context_scales_with_server_slots(self, spawn_stub):
+        backend = FakeLlamaBackend()
+
+        async def scenario():
+            async with running_manager(make_config(), backend, slots=4):
+                pass
 
         asyncio.run(scenario())
+        command = spawn_stub.commands[0]
+        assert command[command.index("-c") + 1] == str(4096 * 4)
+        assert command[command.index("-np") + 1] == "4"
 
-        assert len(vllm_stub.engine_args) == 1
-        engine_args = vllm_stub.engine_args[0]
-        assert engine_args.model == "test/model"
-        assert engine_args.gpu_memory_utilization == pytest.approx(0.90)
-        assert engine_args.max_model_len == 4096
-        assert engine_args.max_num_seqs == 5
-        assert engine_args.enable_prefix_caching is True
-        assert engine_args.disable_log_stats is True
-        assert engine_args.use_tqdm_on_load is False
+    def test_server_command_string_form(self, spawn_stub):
+        backend = FakeLlamaBackend()
+        config = make_config(**{"inference.server_command": "llama-server"})
 
-    def test_max_num_seqs_never_exceeds_estimate(self, vllm_stub):
         async def scenario():
-            manager = InferenceManager(make_config())
-            await manager.start(3)
-            await manager.shutdown()
+            async with running_manager(config, backend, slots=1):
+                pass
 
         asyncio.run(scenario())
-        assert vllm_stub.engine_args[0].max_num_seqs == 3
+        assert spawn_stub.commands[0][0] == "llama-server"
 
-    def test_start_rejects_nonpositive_concurrency(self, vllm_stub):
+    def test_extra_args_appended_last(self, spawn_stub):
+        backend = FakeLlamaBackend()
+        config = make_config(
+            **{"inference.extra_args": ["--cache-type-k", "q8_0"]}
+        )
+
         async def scenario():
-            manager = InferenceManager(make_config())
-            with pytest.raises(InferenceError, match="concurrency"):
+            async with running_manager(config, backend, slots=1):
+                pass
+
+        asyncio.run(scenario())
+        assert spawn_stub.commands[0][-2:] == ["--cache-type-k", "q8_0"]
+
+    def test_start_rejects_nonpositive_slots(self):
+        manager = InferenceManager(make_config())
+
+        async def scenario():
+            with pytest.raises(InferenceError, match="slots"):
                 await manager.start(0)
 
         asyncio.run(scenario())
-        assert vllm_stub.engine_args == []
 
-    def test_engine_created_once(self, vllm_stub):
-        engine = FakeEngine(chat_template=None)
+    def test_start_twice_rejected(self):
+        backend = FakeLlamaBackend()
 
         async def scenario():
-            manager = InferenceManager(make_config())
-            await manager.start(4)
-            await manager.generate("a")
-            await manager.benchmark(["a", "b"], 2)
-            await manager.shutdown()
-
-        vllm_stub.factory = lambda engine_args: engine
-        asyncio.run(scenario())
-        assert vllm_stub.start_calls == 1
-
-    def test_start_twice_rejected(self, vllm_stub):
-        async def scenario():
-            manager = InferenceManager(make_config())
-            await manager.start(2)
-            with pytest.raises(InferenceError, match="already"):
-                await manager.start(2)
-            await manager.shutdown()
+            async with running_manager(make_config(), backend, slots=1) as (m, _):
+                with pytest.raises(InferenceError, match="already"):
+                    await m.start(1)
 
         asyncio.run(scenario())
 
+    def test_missing_model_rejected_before_spawn(self, spawn_stub):
+        manager = InferenceManager(make_config(model="absent.gguf"))
 
-class TestSamplingParams:
-    def test_sampling_params_use_configured_values(self, vllm_stub):
+        async def scenario():
+            with pytest.raises(ValueError, match="not found"):
+                await manager.start(1)
+
+        asyncio.run(scenario())
+        assert spawn_stub.commands == []
+
+
+class TestServerProcess:
+    def test_drain_decodes_bytes_lines(self):
+        class FakeStderr:
+            def __iter__(self):
+                return iter([b"warning: something\n", b"fatal: boom\n"])
+
+        class FakeProc:
+            stderr = FakeStderr()
+
+        process = inference._ServerProcess(FakeProc())
+        process._thread.join(timeout=2)
+        assert list(process.stderr_tail) == ["warning: something", "fatal: boom"]
+
+
+class TestHealth:
+    def test_process_exit_is_fatal_with_stderr_tail(self, monkeypatch):
+        process = FakeServerProcess(
+            exit_code=1,
+            stderr_lines=["llama_model_loader: some failure", "detail line"],
+        )
+
         async def scenario():
             manager = InferenceManager(make_config())
-            await manager.start(2)
-            params = manager._sampling_params
-            await manager.shutdown()
-            return params
+            monkeypatch.setattr(
+                inference, "_spawn_server", lambda command: process
+            )
+            with pytest.raises(InferenceError) as excinfo:
+                await manager.start(1)
+            return excinfo.value
 
-        params = asyncio.run(scenario())
-        assert isinstance(params, SamplingParams)
-        assert params.max_tokens == 2000
-        assert params.temperature == 0.8
-        assert params.top_p == 0.95
-        assert params.output_kind == RequestOutputKind.FINAL_ONLY
+        error = asyncio.run(scenario())
+        assert "exited with code 1" in str(error)
+        assert "llama_model_loader: some failure" in str(error)
 
-    def test_thinking_never_reaches_sampling_params(self, vllm_stub):
-        config = make_config(**{"inference.args.thinking": True})
+    def test_health_timeout_terminates_process(self, monkeypatch):
+        monkeypatch.setattr(inference, "_HEALTH_TIMEOUT_SECONDS", 1.0)
+        backend = FakeLlamaBackend()
+        backend.health_ready = False
+        captured = {}
 
         async def scenario():
+            server = TestServer(backend.app())
+            await server.start_server()
+            config = make_config(**{"inference.port": server.port})
             manager = InferenceManager(config)
-            await manager.start(2)
-            params = manager._sampling_params
-            await manager.shutdown()
-            return params
 
-        params = asyncio.run(scenario())
-        assert not hasattr(params, "thinking")
-        assert not hasattr(params, "enable_thinking")
+            def fake_spawn(command):
+                process = FakeServerProcess()
+                captured["process"] = process
+                return process
 
-
-class TestPromptRendering:
-    def _manager(self, vllm_stub, engine, config=None):
-        vllm_stub.factory = lambda engine_args: engine
-        return InferenceManager(config or make_config())
-
-    def test_chat_template_wraps_exact_instruction(self, vllm_stub):
-        engine = FakeEngine(chat_template="{{ messages }}")
-
-        async def scenario():
-            manager = self._manager(vllm_stub, engine)
-            await manager.start(1)
-            await manager.generate("Eigenvalues and eigenvectors")
-            await manager.shutdown()
+            monkeypatch.setattr(inference, "_spawn_server", fake_spawn)
+            try:
+                with pytest.raises(InferenceError, match="healthy"):
+                    await manager.start(1)
+            finally:
+                await server.close()
 
         asyncio.run(scenario())
-        assert len(engine.renderer.chat_calls) == 1
-        conversations, chat_params = engine.renderer.chat_calls[0]
-        assert conversations == [
-            [{"role": "user", "content": "Eigenvalues and eigenvectors"}]
-        ]
-        assert chat_params.chat_template_kwargs == {"enable_thinking": False}
-        assert engine.requests[0]["prompt"] == {
-            "type": "token",
-            "prompt": "Eigenvalues and eigenvectors",
-        }
-
-    def test_thinking_true_forwarded_to_chat_template(self, vllm_stub):
-        engine = FakeEngine(chat_template="{{ messages }}")
-        config = make_config(**{"inference.args.thinking": True})
-
-        async def scenario():
-            manager = self._manager(vllm_stub, engine, config)
-            await manager.start(1)
-            await manager.generate("topic")
-            await manager.shutdown()
-
-        asyncio.run(scenario())
-        _conversations, chat_params = engine.renderer.chat_calls[0]
-        assert chat_params.chat_template_kwargs == {"enable_thinking": True}
-
-    def test_no_chat_template_submits_raw_text(self, vllm_stub):
-        engine = FakeEngine(chat_template=None)
-
-        async def scenario():
-            manager = self._manager(vllm_stub, engine)
-            await manager.start(1)
-            await manager.generate("raw topic")
-            await manager.shutdown()
-
-        asyncio.run(scenario())
-        assert engine.renderer.chat_calls == []
-        assert engine.requests[0]["prompt"] == "raw topic"
+        assert captured["process"].terminated is True
 
 
 class TestGenerate:
-    def test_returns_text_and_token_count(self, vllm_stub):
-        engine = FakeEngine(text="a full paper", token_count=1234)
+    def test_returns_text_and_token_count(self):
+        backend = FakeLlamaBackend()
+        backend.text = "a full paper"
+        backend.token_count = 1234
 
         async def scenario():
-            manager = InferenceManager(make_config())
-            vllm_stub.factory = lambda engine_args: engine
-            await manager.start(1)
-            result = await manager.generate("topic")
-            await manager.shutdown()
-            return result
+            async with running_manager(make_config(), backend, slots=1) as (m, _):
+                return await m.generate("topic")
 
         assert asyncio.run(scenario()) == ("a full paper", 1234)
 
-    def test_generate_before_start_rejected(self, vllm_stub):
+    def test_payload_matches_configured_sampling(self):
+        backend = FakeLlamaBackend()
+
         async def scenario():
-            manager = InferenceManager(make_config())
+            async with running_manager(make_config(), backend, slots=1) as (m, _):
+                await m.generate("Eigenvalues and eigenvectors")
+
+        asyncio.run(scenario())
+        payload = backend.requests[0]
+        assert payload["messages"] == [
+            {"role": "user", "content": "Eigenvalues and eigenvectors"}
+        ]
+        assert payload["max_tokens"] == 2000
+        assert payload["temperature"] == 0.8
+        assert payload["top_p"] == 0.95
+        assert payload["stream"] is False
+        assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+
+    def test_thinking_true_forwarded_to_chat_template_kwargs(self):
+        backend = FakeLlamaBackend()
+        config = make_config(**{"inference.args.thinking": True})
+
+        async def scenario():
+            async with running_manager(config, backend, slots=1) as (m, _):
+                await m.generate("topic")
+
+        asyncio.run(scenario())
+        assert backend.requests[0]["chat_template_kwargs"] == {
+            "enable_thinking": True
+        }
+
+    def test_empty_content_returns_empty_text(self):
+        backend = FakeLlamaBackend()
+        backend.text = ""
+        backend.token_count = 0
+
+        async def scenario():
+            async with running_manager(make_config(), backend, slots=1) as (m, _):
+                return await m.generate("topic")
+
+        assert asyncio.run(scenario()) == ("", 0)
+
+    def test_inline_thinking_is_stripped_from_content(self):
+        think_open = "<" + "think" + ">"
+        think_close = "</" + "think" + ">"
+        backend = FakeLlamaBackend()
+        backend.raw_body = {
+            "choices": [
+                {
+                    "message": {
+                        "content": think_open
+                        + "lots of reasoning"
+                        + think_close
+                        + "The answer."
+                    }
+                }
+            ],
+            "usage": {"completion_tokens": 42},
+        }
+
+        async def scenario():
+            async with running_manager(make_config(), backend, slots=1) as (m, _):
+                return await m.generate("topic")
+
+        assert asyncio.run(scenario()) == ("The answer.", 42)
+
+    def test_unclosed_thinking_yields_empty_text(self):
+        think_open = "<" + "think" + ">"
+        backend = FakeLlamaBackend()
+        backend.raw_body = {
+            "choices": [
+                {"message": {"content": think_open + "still thinking"}}
+            ],
+            "usage": {"completion_tokens": 500},
+        }
+
+        async def scenario():
+            async with running_manager(make_config(), backend, slots=1) as (m, _):
+                return await m.generate("topic")
+
+        assert asyncio.run(scenario()) == ("", 500)
+
+    def test_reasoning_only_response_returns_empty_text(self):
+        backend = FakeLlamaBackend()
+        backend.raw_body = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": "thinking hard",
+                    }
+                }
+            ],
+            "usage": {"completion_tokens": 500},
+        }
+
+        async def scenario():
+            async with running_manager(make_config(), backend, slots=1) as (m, _):
+                return await m.generate("topic")
+
+        assert asyncio.run(scenario()) == ("", 500)
+
+    def test_non_200_raises_inference_error(self):
+        backend = FakeLlamaBackend()
+        backend.status = 500
+
+        async def scenario():
+            async with running_manager(make_config(), backend, slots=1) as (m, _):
+                with pytest.raises(InferenceError, match="HTTP 500"):
+                    await m.generate("topic")
+
+        asyncio.run(scenario())
+
+    def test_malformed_response_shape_raises(self):
+        backend = FakeLlamaBackend()
+        backend.raw_body = {"unexpected": True}
+
+        async def scenario():
+            async with running_manager(make_config(), backend, slots=1) as (m, _):
+                with pytest.raises(InferenceError, match="unexpected response"):
+                    await m.generate("topic")
+
+        asyncio.run(scenario())
+
+    def test_generate_before_start_rejected(self):
+        manager = InferenceManager(make_config())
+
+        async def scenario():
             with pytest.raises(InferenceError, match="not been started"):
                 await manager.generate("topic")
 
         asyncio.run(scenario())
 
-    def test_generate_after_shutdown_rejected(self, vllm_stub):
+    def test_generate_after_shutdown_rejected(self):
+        backend = FakeLlamaBackend()
+
         async def scenario():
-            manager = InferenceManager(make_config())
-            vllm_stub.factory = lambda engine_args: FakeEngine()
-            await manager.start(1)
-            await manager.shutdown()
+            async with running_manager(make_config(), backend, slots=1) as (m, _):
+                pass
             with pytest.raises(InferenceError, match="shut down"):
-                await manager.generate("topic")
+                await m.generate("topic")
 
         asyncio.run(scenario())
-
-    def test_request_ids_are_unique_and_nonpersisted(self, vllm_stub):
-        engine = FakeEngine()
-
-        async def scenario():
-            manager = InferenceManager(make_config())
-            vllm_stub.factory = lambda engine_args: engine
-            await manager.start(1)
-            await manager.generate("a")
-            await manager.generate("b")
-            await manager.shutdown()
-
-        asyncio.run(scenario())
-        ids = [request["request_id"] for request in engine.requests]
-        assert len(ids) == len(set(ids)) == 2
 
 
 class TestSemaphore:
-    def test_never_exceeds_permit_count(self, vllm_stub):
-        class TrackedEngine(FakeEngine):
-            def __init__(self):
-                super().__init__()
-                self.active = 0
-                self.peak = 0
-
-            async def generate(self, prompt, sampling_params, request_id, **kwargs):
-                self.active += 1
-                self.peak = max(self.peak, self.active)
-                try:
-                    await asyncio.sleep(0.02)
-                finally:
-                    self.active -= 1
-                yield _make_output("doc", 5)
-
-        engine = TrackedEngine()
+    def test_never_exceeds_permit_count(self):
+        backend = FakeLlamaBackend()
+        backend.delay = 0.02
 
         async def scenario():
-            manager = InferenceManager(make_config())
-            vllm_stub.factory = lambda engine_args: engine
-            await manager.start(2)
-            await asyncio.gather(
-                *(manager.generate(f"p{i}") for i in range(10))
-            )
-            await manager.shutdown()
+            async with running_manager(make_config(), backend, slots=2) as (m, _):
+                await asyncio.gather(*(m.generate(f"p{i}") for i in range(10)))
 
         asyncio.run(scenario())
-        assert engine.peak == 2
+        assert backend.peak == 2
 
-    def test_failure_releases_permit(self, vllm_stub):
-        class FlakyEngine(FakeEngine):
-            def __init__(self):
-                super().__init__()
-                self.calls = 0
-
-            async def generate(self, prompt, sampling_params, request_id, **kwargs):
-                self.calls += 1
-                if self.calls == 1:
-                    raise RuntimeError("backend exploded")
-                yield _make_output("recovered", 4)
-
-        engine = FlakyEngine()
+    def test_failure_releases_permit(self):
+        backend = FakeLlamaBackend()
+        backend.fail_remaining = 1
 
         async def scenario():
-            manager = InferenceManager(make_config())
-            vllm_stub.factory = lambda engine_args: engine
-            await manager.start(1)
-            with pytest.raises(RuntimeError):
-                await manager.generate("first")
-            assert manager._semaphore.in_use == 0
-            result = await manager.generate("second")
-            await manager.shutdown()
-            return result
+            async with running_manager(make_config(), backend, slots=1) as (m, _):
+                with pytest.raises(InferenceError):
+                    await m.generate("first")
+                assert m._semaphore.in_use == 0
+                return await m.generate("second")
 
-        assert asyncio.run(scenario()) == ("recovered", 4)
+        assert asyncio.run(scenario()) == ("generated paper", 7)
 
-    def test_cancellation_releases_permit_and_aborts(self, vllm_stub):
-        class CancelEngine(FakeEngine):
-            def __init__(self):
-                super().__init__()
-                self.started = []
-                self.aborted = []
-                self.calls = 0
-
-            async def generate(self, prompt, sampling_params, request_id, **kwargs):
-                self.calls += 1
-                self.started.append(request_id)
-                if self.calls == 1:
-                    try:
-                        await asyncio.sleep(30)
-                        yield _make_output("late", 3)
-                    except asyncio.CancelledError:
-                        self.aborted.append(request_id)
-                        raise
-                else:
-                    yield _make_output("fast", 2)
-
-        engine = CancelEngine()
+    def test_cancellation_releases_permit(self):
+        backend = FakeLlamaBackend()
 
         async def scenario():
-            manager = InferenceManager(make_config())
-            vllm_stub.factory = lambda engine_args: engine
-            await manager.start(1)
-            task = asyncio.create_task(manager.generate("topic"))
-            for _ in range(2000):
-                if engine.started:
-                    break
-                await asyncio.sleep(0.001)
-            assert engine.started
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-            assert engine.aborted
-            assert manager._semaphore.in_use == 0
-            result = await manager.generate("second")
-            await manager.shutdown()
-            return result
+            async with running_manager(make_config(), backend, slots=1) as (m, _):
+                backend.delay = 30.0
+                task = asyncio.create_task(m.generate("long"))
+                for _ in range(500):
+                    if backend.requests:
+                        break
+                    await asyncio.sleep(0.01)
+                assert backend.requests
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert m._semaphore.in_use == 0
+                backend.delay = 0.0
+                return await m.generate("second")
 
-        assert asyncio.run(scenario()) == ("fast", 2)
+        assert asyncio.run(scenario()) == ("generated paper", 7)
 
-    def test_set_concurrency_mutates_same_semaphore(self, vllm_stub):
+    def test_set_concurrency_mutates_same_semaphore(self):
+        backend = FakeLlamaBackend()
+
         async def scenario():
-            manager = InferenceManager(make_config())
-            vllm_stub.factory = lambda engine_args: FakeEngine()
-            await manager.start(8)
-            semaphore = manager._semaphore
-            manager.set_concurrency(3)
-            assert manager._semaphore is semaphore
-            assert semaphore.limit == 3
-            assert semaphore.in_use == 0
-            manager.set_concurrency(10)
-            assert manager._semaphore is semaphore
-            assert semaphore.limit == 10
-            with pytest.raises(ValueError):
-                manager.set_concurrency(0)
-            await manager.shutdown()
+            async with running_manager(make_config(), backend, slots=8) as (m, _):
+                semaphore = m._semaphore
+                m.set_concurrency(3)
+                assert m._semaphore is semaphore
+                assert semaphore.limit == 3
+                assert semaphore.in_use == 0
+                m.set_concurrency(10)
+                assert m._semaphore is semaphore
+                assert semaphore.limit == 10
+                with pytest.raises(ValueError):
+                    m.set_concurrency(0)
 
         asyncio.run(scenario())
 
-    def test_set_concurrency_before_start_rejected(self, vllm_stub):
+    def test_set_concurrency_before_start_rejected(self):
         manager = InferenceManager(make_config())
         with pytest.raises(InferenceError, match="not been started"):
             manager.set_concurrency(2)
@@ -460,137 +576,243 @@ class TestBenchmarkLevels:
         assert InferenceManager._benchmark_levels(6) == [1, 2, 4, 6]
         assert InferenceManager._benchmark_levels(8) == [1, 2, 4, 8]
 
-    def test_benchmark_requires_prompts_and_valid_concurrency(self, vllm_stub):
+    @pytest.mark.parametrize(
+        "peak, max_concurrency, tested, expected",
+        [
+            (32, 35, {1, 2, 4, 8, 16, 32, 35}, [28, 30, 34]),
+            (16, 35, {1, 2, 4, 8, 16, 32, 35}, [12, 14, 18, 20]),
+            (8, 8, {1, 2, 4, 8}, [6]),
+            (4, 8, {1, 2, 4, 8}, [6]),
+            (4, 4, {1, 2, 4}, []),
+            (1, 1, {1}, []),
+        ],
+    )
+    def test_refine_levels_brackets_peak(
+        self, peak, max_concurrency, tested, expected
+    ):
+        assert InferenceManager._refine_levels(
+            peak, max_concurrency, set(tested)
+        ) == expected
+
+    def test_benchmark_requires_prompts_and_valid_concurrency(self):
+        backend = FakeLlamaBackend()
+
         async def scenario():
-            manager = InferenceManager(make_config())
-            vllm_stub.factory = lambda engine_args: FakeEngine()
-            await manager.start(2)
-            with pytest.raises(InferenceError, match="prompt"):
-                await manager.benchmark([], 2)
-            with pytest.raises(InferenceError, match="max_concurrency"):
-                await manager.benchmark(["a"], 0)
-            await manager.shutdown()
+            async with running_manager(make_config(), backend, slots=2) as (m, _):
+                with pytest.raises(InferenceError, match="prompt"):
+                    await m.benchmark([], 2)
+                with pytest.raises(InferenceError, match="max_concurrency"):
+                    await m.benchmark(["a"], 0)
 
         asyncio.run(scenario())
 
-    def test_benchmark_before_start_rejected(self, vllm_stub):
+    def test_benchmark_before_start_rejected(self):
+        manager = InferenceManager(make_config())
+
         async def scenario():
-            manager = InferenceManager(make_config())
             with pytest.raises(InferenceError, match="not been started"):
                 await manager.benchmark(["a"], 2)
 
         asyncio.run(scenario())
 
-    def test_benchmark_sweep_selects_optimum(self, vllm_stub):
-        class ContentionEngine(FakeEngine):
-            def __init__(self, base_delay=0.01, tokens=100, comfortable=4):
-                super().__init__()
-                self.base_delay = base_delay
-                self.tokens = tokens
-                self.comfortable = comfortable
-                self.active = 0
-                self.peak = 0
-                self.completed = 0
-
-            async def generate(self, prompt, sampling_params, request_id, **kwargs):
-                self.active += 1
-                self.peak = max(self.peak, self.active)
-                try:
-                    penalty = 1 + max(0, self.active - self.comfortable)
-                    await asyncio.sleep(self.base_delay * penalty)
-                    self.completed += 1
-                finally:
-                    self.active -= 1
-                yield _make_output("doc", self.tokens)
-
-        engine = ContentionEngine()
+    def test_benchmark_caps_max_tokens_below_production(self):
+        backend = FakeLlamaBackend()
 
         async def scenario():
-            manager = InferenceManager(make_config())
-            vllm_stub.factory = lambda engine_args: engine
-            await manager.start(8)
-            measurements = await manager.benchmark(["a", "b", "c"], 8)
-            selected_limit = manager._semaphore.limit
-            await manager.shutdown()
-            return measurements, selected_limit
+            async with running_manager(make_config(), backend, slots=1) as (m, _):
+                await m.benchmark(["a"], 1)
+                await m.generate("topic")
+
+        asyncio.run(scenario())
+        benchmark_payloads, production_payload = (
+            backend.requests[:-1],
+            backend.requests[-1],
+        )
+        assert benchmark_payloads
+        assert all(
+            p["max_tokens"] == inference._BENCHMARK_MAX_TOKENS
+            for p in benchmark_payloads
+        )
+        assert production_payload["max_tokens"] == 2000
+
+    def test_benchmark_max_tokens_clamped_to_quarter_context(self):
+        backend = FakeLlamaBackend()
+        config = make_config(**{"inference.context_length": 400})
+
+        async def scenario():
+            async with running_manager(config, backend, slots=1) as (m, _):
+                return m._benchmark_max_tokens()
+
+        assert asyncio.run(scenario()) == 100
+
+    def test_benchmark_sweep_selects_optimum(self):
+        backend = FakeLlamaBackend()
+        backend.base_delay = 0.01
+        backend.comfortable = 4
+        backend.token_count = 100
+        backend.text = "doc"
+
+        async def scenario():
+            async with running_manager(make_config(), backend, slots=8) as (m, _):
+                measurements = await m.benchmark(["a", "b", "c"], 8)
+                selected_limit = m._semaphore.limit
+                return measurements, selected_limit
 
         measurements, selected_limit = asyncio.run(scenario())
 
-        assert [m.concurrency for m in measurements] == [1, 2, 4, 8]
+        assert [m.concurrency for m in measurements] == [1, 2, 4, 8, 6]
         assert all(m.output_tokens_per_second > 0 for m in measurements)
         rounds = inference._BENCHMARK_REQUESTS_PER_WORKER
         for measurement in measurements:
             assert measurement.completed_requests == rounds * measurement.concurrency
             assert measurement.total_output_tokens == (
-                measurement.completed_requests * engine.tokens
+                measurement.completed_requests * 100
+            )
+            assert measurement.total_output_characters == (
+                measurement.completed_requests * len("doc")
             )
         assert selected_limit == 4
 
-        measured_requests = sum(m.completed_requests for m in measurements)
-        assert engine.completed == measured_requests + 2
-
-    def test_failing_level_is_skipped(self, vllm_stub):
-        class ThresholdFailEngine(FakeEngine):
-            def __init__(self, threshold):
-                super().__init__()
-                self.threshold = threshold
-                self.active = 0
-                self.peak = 0
-
-            async def generate(self, prompt, sampling_params, request_id, **kwargs):
-                self.active += 1
-                self.peak = max(self.peak, self.active)
-                try:
-                    await asyncio.sleep(0)
-                    if self.peak >= self.threshold:
-                        raise RuntimeError("too much concurrency")
-                    yield _make_output("ok", 5)
-                finally:
-                    self.active -= 1
-
-        engine = ThresholdFailEngine(threshold=4)
+    def test_failing_level_is_skipped(self):
+        backend = FakeLlamaBackend()
+        backend.delay = 0.05
+        backend.fail_when_active = 4
 
         async def scenario():
-            manager = InferenceManager(make_config())
-            vllm_stub.factory = lambda engine_args: engine
-            await manager.start(8)
-            measurements = await manager.benchmark(["a", "b", "c"], 8)
-            await manager.shutdown()
-            return measurements
+            async with running_manager(make_config(), backend, slots=8) as (m, _):
+                return await m.benchmark(["a", "b", "c"], 8)
 
         measurements = asyncio.run(scenario())
         assert [m.concurrency for m in measurements] == [1, 2]
 
-    def test_all_levels_failing_is_fatal(self, vllm_stub):
-        class DeadEngine(FakeEngine):
-            async def generate(self, prompt, sampling_params, request_id, **kwargs):
-                raise RuntimeError("engine dead")
-                yield  # pragma: no cover
+    def test_all_levels_failing_is_fatal(self):
+        backend = FakeLlamaBackend()
+        backend.status = 500
 
         async def scenario():
-            manager = InferenceManager(make_config())
-            vllm_stub.factory = lambda engine_args: DeadEngine()
-            await manager.start(4)
-            with pytest.raises(InferenceError, match="unhealthy"):
-                await manager.benchmark(["a", "b"], 4)
-            await manager.shutdown()
+            async with running_manager(make_config(), backend, slots=4) as (m, _):
+                with pytest.raises(InferenceError, match="unhealthy"):
+                    await m.benchmark(["a", "b"], 2)
 
         asyncio.run(scenario())
+
+    def test_empty_content_is_not_counted_as_completed(self):
+        backend = FakeLlamaBackend()
+        backend.text = ""
+        backend.token_count = 500
+
+        async def scenario():
+            async with running_manager(make_config(), backend, slots=1) as (m, _):
+                with pytest.raises(InferenceError, match="unhealthy"):
+                    await m.benchmark(["a"], 1)
+
+        asyncio.run(scenario())
+
+    def test_zero_token_output_is_not_counted_as_completed(self):
+        backend = FakeLlamaBackend()
+        backend.text = "doc"
+        backend.token_count = 0
+
+        async def scenario():
+            async with running_manager(make_config(), backend, slots=1) as (m, _):
+                with pytest.raises(InferenceError, match="unhealthy"):
+                    await m.benchmark(["a"], 1)
+
+        asyncio.run(scenario())
+
+    def test_dead_server_aborts_benchmark_with_stderr_tail(self, spawn_stub):
+        backend = FakeLlamaBackend()
+
+        async def scenario():
+            async with running_manager(make_config(), backend, slots=2) as (m, _):
+                process = spawn_stub.processes[0]
+                process.stderr_tail.append("cudaMalloc failed: out of memory")
+                process.die(1)
+                with pytest.raises(
+                    InferenceError, match="exited with code 1"
+                ) as excinfo:
+                    await m.benchmark(["a"], 2)
+                return str(excinfo.value)
+
+        message = asyncio.run(scenario())
+        assert "cudaMalloc failed: out of memory" in message
+
+    def test_progress_callback_reports_monotonic_counts(self):
+        backend = FakeLlamaBackend()
+        calls = []
+
+        async def scenario():
+            async with running_manager(make_config(), backend, slots=8) as (m, _):
+                await m.benchmark(
+                    ["a", "b", "c"], 8, on_progress=lambda *args: calls.append(args)
+                )
+
+        asyncio.run(scenario())
+
+        expected_total = 2 + 3 * (1 + 2 + 4 + 8) + 3 * 6
+        completed = [call[0] for call in calls]
+        assert completed == list(range(1, expected_total + 1))
+        assert calls[-1][0] == calls[-1][1] == expected_total
+        coarse_total = 2 + 3 * (1 + 2 + 4 + 8)
+        assert calls[0][1] == coarse_total
+        assert calls[coarse_total - 1][1] == coarse_total
+        assert calls[coarse_total][1] == expected_total
+        assert calls[0][2] == "warmup"
+        assert "level 4/4" in [call[2] for call in calls]
+        assert "refine 1/1" in [call[2] for call in calls]
+
+    def test_progress_callback_completes_even_when_all_levels_fail(self):
+        backend = FakeLlamaBackend()
+        backend.status = 500
+        calls = []
+
+        async def scenario():
+            async with running_manager(make_config(), backend, slots=4) as (m, _):
+                with pytest.raises(InferenceError, match="unhealthy"):
+                    await m.benchmark(
+                        ["a", "b"], 4, on_progress=lambda *args: calls.append(args)
+                    )
+
+        asyncio.run(scenario())
+
+        expected_total = 2 + 3 * (1 + 2 + 4)
+        assert calls[-1][0] == calls[-1][1] == expected_total
 
 
 class TestShutdown:
-    def test_shutdown_engine_and_idempotent(self, vllm_stub):
-        engine = FakeEngine()
+    def test_shutdown_terminates_process_and_is_idempotent(self, spawn_stub):
+        backend = FakeLlamaBackend()
 
         async def scenario():
-            manager = InferenceManager(make_config())
-            vllm_stub.factory = lambda engine_args: engine
-            await manager.start(1)
-            await manager.shutdown()
-            await manager.shutdown()
+            async with running_manager(make_config(), backend, slots=1) as (m, _):
+                pass
 
         asyncio.run(scenario())
-        assert engine.shutdown_called is True
+        process = spawn_stub.processes[0]
+        assert process.terminated is True
+
+    def test_kill_used_when_terminate_insufficient(self, monkeypatch):
+        monkeypatch.setattr(inference, "_SHUTDOWN_GRACE_SECONDS", 0.2)
+        backend = FakeLlamaBackend()
+
+        async def scenario():
+            server = TestServer(backend.app())
+            await server.start_server()
+            config = make_config(**{"inference.port": server.port})
+            manager = InferenceManager(config)
+            process = FakeServerProcess(terminate_exit_code=None)
+
+            monkeypatch.setattr(
+                inference, "_spawn_server", lambda command: process
+            )
+            await manager.start(1)
+            await manager.shutdown()
+            await server.close()
+            return process
+
+        process = asyncio.run(scenario())
+        assert process.terminated is True
+        assert process.killed is True
 
 
 class TestIsolation:
@@ -610,12 +832,26 @@ class TestIsolation:
             "asyncio",
             "itertools",
             "logging",
+            "subprocess",
+            "threading",
             "time",
             "collections",
             "dataclasses",
         }
 
     def test_no_file_io_in_module(self):
+        import re
+
         source = inspect.getsource(inference)
-        assert "open(" not in source
+        assert re.search(r"\bopen\(", source) is None
         assert "writer" not in source
+
+    def test_aiohttp_imported_lazily(self):
+        source = inspect.getsource(inference)
+        tree = ast.parse(source)
+        for node in tree.body:
+            if isinstance(node, ast.ImportFrom) and node.module == "aiohttp":
+                raise AssertionError("aiohttp imported at module scope")
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert alias.name != "aiohttp"

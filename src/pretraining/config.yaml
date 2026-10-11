@@ -1,16 +1,21 @@
-model: "your-huggingface-model-id"
-
-generation:
-  total_tokens: 1_000_000_000
-  max_ctx: 256_0000
-  model_weight_overhead: null       # REQUIRED: GiB of fixed model/runtime VRAM
-  model_max_ctx_overhead: null      # REQUIRED: GiB of KV memory at max_ctx tokens
+model: "LFM2.5-2.6B-Q4_K_M.gguf"    # GGUF filename in models/ (or absolute path); must already be downloaded
 
 inference:
-  max_gpu_memory_utilization: 0.90
-  max_model_len: 4096               # REQUIRED: per-request context limit
+  max_gpu_memory_utilization: 0.90  # VRAM cap for the KV budget: (total_vram*cap - weights) / KV-per-request
+  context_length: 32_000              # per-request context; server gets -c context_length * np
+  kv_bytes_per_token: 4608.0        # REQUIRED: KV bytes for one token of one sequence, measured with the q4_0 cache flags this script passes
+  port: 8080
+  server_command: ["llama", "serve"]  # llama.cpp server command (e.g. "llama-server" on older builds)
+  # LFM2.5-2.6B is a pure reasoning model: its chat template always opens  thinking
+  # and ignores enable_thinking. Bound that thinking to zero and inject a closing
+  # message so the model writes the answer instead of reasoning in plain prose.
+  extra_args:                          # appended to the server command (last-wins overrides)
+    - --reasoning-budget
+    - "0"
+    - --reasoning-budget-message
+    - "I have reasoned enough; now I will write the response directly."
   args:
-    max_tokens: 2000                # REQUIRED: per-request output maximum
+    max_tokens: 30_000                # REQUIRED: per-request output maximum
     temperature: 0.8
     top_p: 0.95
     thinking: false

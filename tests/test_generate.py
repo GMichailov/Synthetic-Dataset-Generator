@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from src.pretraining import generate as gen
+from src.pretraining import nvidia_generation as ng
 from src.pretraining.dataloader import TopicLoader
 from src.pretraining.inference import BenchmarkMeasurement
 from src.pretraining.nvidia_generation import CapacityReport
@@ -13,16 +14,14 @@ from src.pretraining.writer import TextWriter
 
 def make_config(**overrides):
     config = {
-        "model": "test-model",
-        "generation": {
-            "total_tokens": 1_000_000,
-            "max_ctx": 256_000,
-            "model_weight_overhead": 20.0,
-            "model_max_ctx_overhead": 5.0,
-        },
+        "model": "test-model.gguf",
         "inference": {
             "max_gpu_memory_utilization": 0.90,
-            "max_model_len": 4096,
+            "context_length": 4096,
+            "kv_bytes_per_token": 1024.0,
+            "port": 8080,
+            "server_command": ["llama", "serve"],
+            "extra_args": [],
             "args": {
                 "max_tokens": 2000,
                 "temperature": 0.8,
@@ -49,9 +48,9 @@ def make_capacity(concurrency=8):
     return CapacityReport(
         total_vram_bytes=80 * 2**30,
         allowed_vram_bytes=72 * 2**30,
-        fixed_overhead_bytes=20 * 2**30,
+        model_weights_bytes=2 * 2**30,
         kv_bytes_per_token=1024.0,
-        worst_case_tokens_per_sequence=4096,
+        per_request_context_tokens=4096,
         estimated_concurrency=concurrency,
     )
 
@@ -62,6 +61,7 @@ class FakeInference:
     def __init__(self, config):
         self.config = config
         self.events = []
+        self.progress_calls = []
         self.selected = None
         self.started = False
         self.shut_down = False
@@ -76,12 +76,16 @@ class FakeInference:
         self.started = True
         self.events.append(("start", estimated_concurrency))
 
-    async def benchmark(self, sample_prompts, max_concurrency):
+    async def benchmark(self, sample_prompts, max_concurrency, on_progress=None):
         self.events.append(("benchmark", tuple(sample_prompts)))
+        if on_progress is not None:
+            for completed in range(1, 5):
+                on_progress(completed, 4, f"level {completed}/4")
+                self.progress_calls.append((completed, 4))
         return [
-            BenchmarkMeasurement(1, 100.0, 4, 400, 4.0),
-            BenchmarkMeasurement(2, 190.0, 4, 800, 4.2),
-            BenchmarkMeasurement(4, 200.0, 8, 1600, 8.0),
+            BenchmarkMeasurement(1, 100.0, 4, 400, 4.0, 400),
+            BenchmarkMeasurement(2, 190.0, 4, 800, 4.2, 800),
+            BenchmarkMeasurement(4, 200.0, 8, 1600, 8.0, 1600),
         ]
 
     def set_concurrency(self, concurrency):
@@ -114,6 +118,15 @@ def reset_fakes():
     FakeInference.instances = []
 
 
+@pytest.fixture(autouse=True)
+def models_dir(tmp_path, monkeypatch):
+    models = tmp_path / "models"
+    models.mkdir()
+    (models / "test-model.gguf").write_bytes(b"x" * 1024)
+    monkeypatch.setattr(ng, "_MODELS_DIR", models)
+    return models
+
+
 @pytest.fixture
 def patch_environment(monkeypatch, tmp_path):
     prompt_dir = tmp_path / "prompts"
@@ -134,8 +147,8 @@ def write_prompt_file(prompt_dir, name, content):
     (prompt_dir / name).write_text(content, encoding="utf-8")
 
 
-def run_sync(config):
-    return asyncio.run(gen.run(config))
+def run_sync(config, **kwargs):
+    return asyncio.run(gen.run(config, **kwargs))
 
 
 class TestConfigValidation:
@@ -146,7 +159,7 @@ class TestConfigValidation:
         path = tmp_path / "config.yaml"
         path.write_text(yaml.safe_dump(config), encoding="utf-8")
         loaded = gen.load_config(str(path))
-        assert loaded["model"] == "test-model"
+        assert loaded["model"] == "test-model.gguf"
 
     def test_missing_config_file(self, tmp_path):
         with pytest.raises(FileNotFoundError):
@@ -156,23 +169,49 @@ class TestConfigValidation:
         import yaml
 
         config = make_config()
-        del config["inference"]["max_model_len"]
+        del config["inference"]["context_length"]
         path = tmp_path / "config.yaml"
         path.write_text(yaml.safe_dump(config), encoding="utf-8")
-        with pytest.raises(ValueError, match="max_model_len"):
+        with pytest.raises(ValueError, match="context_length"):
             gen.load_config(str(path))
 
     def test_empty_model_rejected(self):
         with pytest.raises(ValueError, match="model"):
             gen._validate_config(make_config(model=""))
 
+    def test_missing_model_file_rejected(self):
+        with pytest.raises(ValueError, match="not found"):
+            gen._validate_config(make_config(model="absent.gguf"))
+
     def test_empty_storage_path_rejected(self):
         with pytest.raises(ValueError, match="storage.path"):
             gen._validate_config(make_config(**{"storage.path": "  "}))
 
-    def test_null_overhead_rejected(self):
-        with pytest.raises(ValueError, match="model_weight_overhead"):
-            gen._validate_config(make_config(**{"generation.model_weight_overhead": None}))
+    def test_null_kv_bytes_per_token_rejected(self):
+        with pytest.raises(ValueError, match="kv_bytes_per_token"):
+            gen._validate_config(
+                make_config(**{"inference.kv_bytes_per_token": None})
+            )
+
+    def test_invalid_port_rejected(self):
+        with pytest.raises(ValueError, match="inference.port"):
+            gen._validate_config(make_config(**{"inference.port": 0}))
+
+    def test_port_above_65535_rejected(self):
+        with pytest.raises(ValueError, match="inference.port"):
+            gen._validate_config(make_config(**{"inference.port": 70000}))
+
+    def test_invalid_server_command_rejected(self):
+        with pytest.raises(ValueError, match="server_command"):
+            gen._validate_config(
+                make_config(**{"inference.server_command": []})
+            )
+
+    def test_invalid_extra_args_rejected(self):
+        with pytest.raises(ValueError, match="extra_args"):
+            gen._validate_config(
+                make_config(**{"inference.extra_args": ["ok", 5]})
+            )
 
     def test_negative_temperature_rejected(self):
         with pytest.raises(ValueError, match="temperature"):
@@ -191,8 +230,10 @@ class TestConfigValidation:
             gen._validate_config(make_config(**{"inference.args.max_tokens": 4096}))
 
     def test_non_positive_target_rejected(self):
-        with pytest.raises(ValueError, match="total_tokens"):
-            gen._validate_config(make_config(**{"generation.total_tokens": 0}))
+        with pytest.raises(ValueError, match="characters_to_generate"):
+            gen._validate_config(
+                make_config(**{"storage.characters_to_generate": 0})
+            )
 
     def test_utilization_above_one_rejected(self):
         with pytest.raises(ValueError, match="max_gpu_memory_utilization"):
@@ -205,7 +246,7 @@ class TestPipeline:
     def test_outputs_are_only_raw_text(self, patch_environment):
         prompt_dir, output_dir, install = patch_environment
         write_prompt_file(prompt_dir, "a.txt", "Heading\nTopic1\nTopic2\nTopic3\n")
-        config = install(make_config(**{"generation.total_tokens": 1_000}))
+        config = install(make_config(**{"storage.characters_to_generate": 1_000}))
 
         run_sync(config)
 
@@ -227,21 +268,10 @@ class TestPipeline:
         fake = FakeInference.instances[0]
         kinds = [event[0] for event in fake.events]
         assert kinds.index("benchmark") < kinds.index("generate")
-        assert fake.selected == 2
+        assert fake.selected == 4
         assert fake.started is True
         assert fake.shut_down is True
-
-    def test_token_target_stops_run(self, patch_environment):
-        prompt_dir, output_dir, install = patch_environment
-        topics = "\n".join(f"Topic{i}" for i in range(20))
-        write_prompt_file(prompt_dir, "a.txt", f"Heading\n{topics}\n")
-        config = install(make_config(**{"generation.total_tokens": 250}))
-
-        run_sync(config)
-
-        content = (output_dir / "000000.txt").read_text(encoding="utf-8")
-        documents = content.count("Paper ")
-        assert 3 <= documents <= 20
+        assert fake.progress_calls == [(1, 4), (2, 4), (3, 4), (4, 4)]
 
     def test_character_target_stops_run(self, patch_environment):
         prompt_dir, output_dir, install = patch_environment
@@ -289,7 +319,7 @@ class TestPipeline:
     def test_bounded_retry_recovers(self, patch_environment):
         prompt_dir, output_dir, install = patch_environment
         write_prompt_file(prompt_dir, "a.txt", "Heading\nTopic1\n")
-        config = install(make_config(**{"generation.total_tokens": 1_000}))
+        config = install(make_config(**{"storage.characters_to_generate": 1_000}))
 
         original = FakeInference.generate
 
@@ -309,7 +339,7 @@ class TestPipeline:
     def test_permanent_failure_does_not_abort_run(self, patch_environment):
         prompt_dir, output_dir, install = patch_environment
         write_prompt_file(prompt_dir, "a.txt", "Heading\nBadTopic\nGoodTopic\n")
-        config = install(make_config(**{"generation.total_tokens": 1_000}))
+        config = install(make_config(**{"storage.characters_to_generate": 1_000}))
 
         original = FakeInference.generate
 
@@ -411,9 +441,71 @@ class TestPipeline:
     def test_targets_use_committed_output_only(self, patch_environment):
         prompt_dir, output_dir, install = patch_environment
         write_prompt_file(prompt_dir, "a.txt", "Heading\nTopic1\nTopic2\n")
-        config = install(make_config(**{"generation.total_tokens": 150}))
+        config = install(make_config(**{"storage.characters_to_generate": 150}))
 
         run_sync(config)
 
         content = (output_dir / "000000.txt").read_text(encoding="utf-8")
         assert content.count("Paper ") >= 2
+
+
+class TestTimeframe:
+    def test_timeframe_skips_writer_and_pipeline(
+        self, patch_environment, monkeypatch, capsys
+    ):
+        prompt_dir, output_dir, install = patch_environment
+        write_prompt_file(prompt_dir, "a.txt", "Heading\nTopic1\nTopic2\n")
+        config = install(make_config())
+
+        pipeline_calls = []
+
+        async def record_pipeline(*args, **kwargs):
+            pipeline_calls.append(True)
+
+        monkeypatch.setattr(gen, "_run_pipeline", record_pipeline)
+
+        run_sync(config, timeframe_only=True)
+
+        assert pipeline_calls == []
+        assert not output_dir.exists()
+        fake = FakeInference.instances[0]
+        kinds = [event[0] for event in fake.events]
+        assert "benchmark" in kinds
+        assert "generate" not in kinds
+        assert fake.shut_down is True
+        out = capsys.readouterr().out
+        assert "Timeframe estimate" in out
+        # concurrency 4 wins selection at 1600 chars / 8.0 s = 200 chars/s;
+        # 1_000_000 / 200 = 5000 s = 01:23:20
+        assert "01:23:20" in out
+
+    def test_timeframe_estimate_math(self, capsys):
+        config = make_config(**{"storage.characters_to_generate": 3_600_000})
+        measurements = [BenchmarkMeasurement(2, 1000.0, 4, 4000, 4.0, 4000)]
+
+        gen._print_timeframe_estimate(config, measurements, 2)
+
+        out = capsys.readouterr().out
+        assert "3,600,000" in out
+        assert "1,000.0 chars/s" in out
+        assert "01:00:00" in out
+
+    def test_timeframe_zero_throughput_raises_clear_error(self):
+        config = make_config()
+        measurements = [BenchmarkMeasurement(1, 21.1, 2, 1000, 47.37, 0)]
+
+        with pytest.raises(RuntimeError, match="zero output throughput"):
+            gen._print_timeframe_estimate(config, measurements, 1)
+
+    def test_timeframe_ignores_existing_output_shards(self, patch_environment):
+        prompt_dir, output_dir, install = patch_environment
+        write_prompt_file(prompt_dir, "a.txt", "Heading\nTopic1\n")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        existing = output_dir / "000000.txt"
+        existing.write_text("preexisting", encoding="utf-8")
+        config = install(make_config())
+
+        run_sync(config, timeframe_only=True)
+
+        assert existing.read_text(encoding="utf-8") == "preexisting"
+        assert FakeInference.instances[0].shut_down is True

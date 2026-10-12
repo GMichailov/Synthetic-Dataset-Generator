@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple, TextIO
 
-_PROMPT_TEMPLATE = "Write me a paper explaining {topic} to me as if I am a Master's university student."
+_PROMPT_TEMPLATE = "Write me an textbook-length academic-quality paper explaining the entriety of {topic}."
 _BLOCK_SIZE = 51
 
 

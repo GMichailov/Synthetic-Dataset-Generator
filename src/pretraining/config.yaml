@@ -27,5 +27,5 @@ inference:
 
 storage:
   path: "./output"
-  characters_per_file: 150_000
-  characters_to_generate: 300_000
+  characters_per_file: 10_000_000
+  characters_to_generate: 100_000_000_000

@@ -58,12 +58,24 @@ class FakeLlamaBackend:
         self.token_count = 7
         self.health_ready = True
         self.raw_body = None
+        self.metrics_body = ""
+        self.metrics_status = 200
+        self.metrics_calls = 0
 
     def app(self):
         app = web.Application()
         app.router.add_get("/health", self._handle_health)
         app.router.add_post("/v1/chat/completions", self._handle_chat)
+        app.router.add_get("/metrics", self._handle_metrics)
         return app
+
+    async def _handle_metrics(self, request):
+        self.metrics_calls += 1
+        if self.metrics_status != 200:
+            return web.Response(status=self.metrics_status, text="metrics disabled")
+        return web.Response(
+            text=self.metrics_body, content_type="text/plain"
+        )
 
     async def _handle_health(self, request):
         if self.health_ready:
@@ -855,3 +867,101 @@ class TestIsolation:
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     assert alias.name != "aiohttp"
+
+
+class TestDecodedTokenProgress:
+    """Live token progress is read from llama-server's Prometheus counter."""
+
+    METRIC = inference._DECODED_TOKENS_METRIC
+
+    def test_reads_counter_from_exposition(self):
+        body = (
+            "# HELP llamacpp:n_decode_total Number of decode iterations\n"
+            "# TYPE llamacpp:n_decode_total counter\n"
+            "llamacpp:n_decode_total 1261\n"
+            "llamacpp:prompt_tokens_total 19\n"
+        )
+        assert inference._parse_counter(body, self.METRIC) == 1261.0
+
+    def test_counter_value_may_be_fractional(self):
+        assert inference._parse_counter(f"{self.METRIC} 12.5\n", self.METRIC) == 12.5
+
+    def test_ignores_metrics_with_a_longer_shared_prefix(self):
+        body = (
+            "llamacpp:n_decode_total_extra 99\n"
+            f"{self.METRIC} 7\n"
+        )
+        assert inference._parse_counter(body, self.METRIC) == 7.0
+
+    def test_missing_metric_reads_zero(self):
+        assert inference._parse_counter("llamacpp:other 1\n", self.METRIC) == 0.0
+        assert inference._parse_counter("", self.METRIC) == 0.0
+        assert inference._parse_counter(None, self.METRIC) == 0.0
+
+    def test_unusable_value_reads_zero(self):
+        assert inference._parse_counter(f"{self.METRIC} n/a\n", self.METRIC) == 0.0
+        assert inference._parse_counter(f"{self.METRIC}\n", self.METRIC) == 0.0
+        assert (
+            inference._parse_counter(f"{self.METRIC}{{slot=\"0\"}} x\n", self.METRIC)
+            == 0.0
+        )
+
+    def _sampled(self, backend, monkeypatch):
+        async def scenario():
+            server = TestServer(backend.app())
+            await server.start_server()
+            config = make_config(**{"inference.port": server.port})
+            manager = InferenceManager(config)
+            monkeypatch.setattr(
+                inference, "_spawn_server", lambda command: FakeServerProcess()
+            )
+            await manager.start(1)
+            try:
+                return await manager.sample_decoded_tokens()
+            finally:
+                await manager.shutdown()
+                await server.close()
+
+        return asyncio.run(scenario())
+
+    def test_reads_live_progress_from_the_server(self, monkeypatch):
+        backend = FakeLlamaBackend()
+        backend.metrics_body = f"{self.METRIC} 1001\n"
+        assert self._sampled(backend, monkeypatch) == 1001.0
+
+    def test_disabled_endpoint_degrades_to_zero(self, monkeypatch):
+        backend = FakeLlamaBackend()
+        backend.metrics_status = 404
+        assert self._sampled(backend, monkeypatch) == 0.0
+
+    def test_unreadable_body_degrades_to_zero(self, monkeypatch):
+        backend = FakeLlamaBackend()
+        backend.metrics_body = "totally not metrics"
+        assert self._sampled(backend, monkeypatch) == 0.0
+
+    def test_sampling_before_start_returns_zero(self):
+        manager = InferenceManager(make_config())
+        assert asyncio.run(manager.sample_decoded_tokens()) == 0.0
+
+    def test_sampling_after_server_exit_returns_zero(self, monkeypatch):
+        backend = FakeLlamaBackend()
+        backend.metrics_body = f"{self.METRIC} 10\n"
+
+        async def scenario():
+            server = TestServer(backend.app())
+            await server.start_server()
+            config = make_config(**{"inference.port": server.port})
+            manager = InferenceManager(config)
+            process = FakeServerProcess()
+            monkeypatch.setattr(
+                inference, "_spawn_server", lambda command: process
+            )
+            await manager.start(1)
+            process.die(1)
+            try:
+                return await manager.sample_decoded_tokens()
+            finally:
+                await manager.shutdown()
+                await server.close()
+
+        assert asyncio.run(scenario()) == 0.0

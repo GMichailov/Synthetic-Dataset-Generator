@@ -10,6 +10,11 @@ inference:
   # and ignores enable_thinking. Bound that thinking to zero and inject a closing
   # message so the model writes the answer instead of reasoning in plain prose.
   extra_args:                          # appended to the server command (last-wins overrides)
+    # Expose the Prometheus endpoint so the dashboard can read the server's
+    # live decode counter; without it a throughput reading only moves when a
+    # whole paper completes, and sits at zero in between.
+    - --metrics
+    - --slots
     - --reasoning-budget
     - "0"
     - --reasoning-budget-message

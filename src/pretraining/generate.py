@@ -56,6 +56,10 @@ _NON_TTY_SNAPSHOT_SECONDS = 2.0
 _RATE_WINDOW_SECONDS = 30.0
 _GIB = 2**30
 
+_BUDGET_POLL_SECONDS = 0.05
+_STATUS_TARGET = "stopping — CHARACTER_TARGET"
+_STATUS_BUDGET = "stopping — BUDGET"
+
 
 class _Interrupted(Exception):
     """Raised after a SIGINT has been drained and cleanup has completed."""
@@ -71,11 +75,77 @@ class _RunState:
     stop_event: asyncio.Event = field(default_factory=asyncio.Event)
     resumed_topics: int = 0
     resumed_files: int = 0
+    character_target: int = 0
+    committed_characters: int = 0
+    sequences_completed: int = 0
+    _average_chars_per_doc: float = 0.0
 
-    def note_committed(self, characters: int, character_target: int) -> None:
-        if characters >= character_target and not self.stop_event.is_set():
-            self.status = "stopping — CHARACTER_TARGET"
+    def note_committed(
+        self, characters: int, document_characters: int
+    ) -> None:
+        """Record a freshly appended document and re-evaluate the budget.
+
+        ``characters`` is the running total written to disk; ``document_characters``
+        is the size of the document just appended, which feeds the running mean
+        used to project how much the already-dispatched work will overshoot.
+        """
+        self.committed_characters = characters
+        self.sequences_completed += 1
+        if document_characters > 0:
+            count = self.sequences_completed
+            self._average_chars_per_doc = (
+                self._average_chars_per_doc * (count - 1) + document_characters
+            ) / count
+        if characters >= self.character_target and not self.stop_event.is_set():
+            self.status = _STATUS_TARGET
             self.stop_event.set()
+
+    @property
+    def average_chars_per_doc(self) -> float:
+        return self._average_chars_per_doc
+
+    def remaining_characters(self) -> int:
+        return max(0, self.character_target - self.committed_characters)
+
+    def note_budget_exhausted(self) -> None:
+        """Record that the target is projected met so the UI can say so.
+
+        Scheduling has already stopped by this point; this only labels the run.
+        The run itself ends when ``committed_characters`` actually reaches the
+        target, so nothing is ever terminated on a projection alone.
+        """
+        if self.status == "generating":
+            self.status = _STATUS_BUDGET
+
+    def projected_characters(self, outstanding: int) -> float:
+        """Characters expected on disk once all outstanding work has drained.
+
+        Before the first document is committed there is no measured mean, so a
+        deliberately pessimistic estimate is used: one document is assumed to be
+        worth a quarter of the target. That keeps the initial fill of the
+        pipeline bounded even though nothing has been measured yet.
+        """
+        if self.sequences_completed == 0:
+            estimate = max(1.0, self.character_target / 4.0)
+        else:
+            estimate = self._average_chars_per_doc
+        return self.committed_characters + outstanding * estimate
+
+    def budget_spent(self, outstanding: int = 0) -> bool:
+        """Report whether the target is projected to be met by pending work.
+
+        ``outstanding`` counts work already accepted but not yet written:
+        queued jobs plus in-flight requests plus anything buffered in the
+        result queue. Each will eventually append a document of roughly
+        ``average_chars_per_doc`` characters.
+
+        This is a throttle, not a stop. Callers stop accepting new work and let
+        the pending tail drain, which is what bounds the overshoot; the run
+        itself finishes only once the committed total actually reaches the
+        target. Throttling rather than terminating also means a pessimistic
+        early estimate can never end a run that has written nothing.
+        """
+        return self.projected_characters(outstanding) >= self.character_target
 
 
 def _require(condition: bool, message: str) -> None:
@@ -391,6 +461,15 @@ async def _worker(
         try:
             if job is None:
                 return
+            # The producer gates dispatch on the projected budget, but a job can
+            # still sit in the queue after the projection is spent. Such a job was
+            # never dispatched, so discarding it costs nothing: its topic is not
+            # marked complete and is regenerated on a later run. Discarding also
+            # shrinks the outstanding count, which is what lets the producer's
+            # throttle observe progress and resume dispatching.
+            if state.budget_spent(job_queue.qsize() + state.in_flight):
+                state.note_budget_exhausted()
+                continue
             state.in_flight += 1
             try:
                 text, output_tokens = await _generate_with_retry(
@@ -436,10 +515,7 @@ async def _writer_consumer(
                 checkpoint.record_writer(writer.resume_state())
                 checkpoint.save(checkpoint_path)
             snapshot = writer.snapshot()
-            state.note_committed(
-                snapshot.generated_characters_appended,
-                character_target,
-            )
+            state.note_committed(snapshot.total_characters_written, len(text))
         finally:
             result_queue.task_done()
 
@@ -457,8 +533,17 @@ async def _producer(
             return
         state.round_number += 1
         for job in current:
-            if state.stop_event.is_set():
-                break
+            # Throttle rather than abandon the round. Waiting here keeps the
+            # round intact for the resume ledger, and the wait always ends:
+            # workers are never blocked on the budget, so the outstanding tail
+            # keeps draining and committing while the producer sleeps.
+            while state.budget_spent(
+                job_queue.qsize() + state.in_flight + result_queue.qsize()
+            ):
+                state.note_budget_exhausted()
+                if state.stop_event.is_set():
+                    return
+                await asyncio.sleep(_BUDGET_POLL_SECONDS)
             await job_queue.put(job)
         await job_queue.join()
         await result_queue.join()
@@ -471,22 +556,55 @@ async def _producer(
             return
 
 
-def _sample_rate(history: deque[tuple[float, int]], snapshot: WriteStats) -> None:
-    history.append((time.monotonic(), snapshot.output_tokens_appended))
-    cutoff = history[-1][0] - _RATE_WINDOW_SECONDS
-    while len(history) > 1 and history[0][0] < cutoff:
+def _sample_rate(history: deque[tuple[float, int]], decoded_tokens: float) -> None:
+    """Record a live token reading and drop samples that fell out of the window.
+
+    ``decoded_tokens`` is the server's cumulative decode counter, which advances
+    for tokens belonging to requests still in flight. Unlike a counter fed only
+    by completed documents, it never sits still while work is happening.
+    """
+    now = time.monotonic()
+    history.append((now, decoded_tokens))
+    cutoff = now - _RATE_WINDOW_SECONDS
+    while history and history[0][0] < cutoff:
         history.popleft()
 
 
-def _window_rate(history: deque[tuple[float, int]], tokens: int) -> float:
-    if not history:
+def _window_rate(history: deque[tuple[float, int]], decoded_tokens: float) -> float:
+    """Return tokens/sec over the trailing window, or 0.0 if it is unusable.
+
+    The span is measured from the newest sample that still lies inside the
+    window rather than from the oldest retained sample, so a partially filled
+    window is divided by the time it actually covers instead of by whatever
+    happens to be sitting at the front of the deque.
+    """
+    if len(history) < 2:
         return 0.0
-    start_time, start_tokens = history[0]
     now = time.monotonic()
-    span = now - start_time
+    newest_time, newest_tokens = history[-1]
+    anchor_time, anchor_tokens = newest_time, newest_tokens
+    for sample_time, sample_tokens in history:
+        if sample_time > now - _RATE_WINDOW_SECONDS:
+            anchor_time, anchor_tokens = sample_time, sample_tokens
+            break
+    span = now - anchor_time
     if span <= 0:
         return 0.0
-    return max(0.0, (tokens - start_tokens) / span)
+    # decoded_tokens may be newer than the last recorded sample.
+    return max(0.0, decoded_tokens - anchor_tokens) / span
+
+
+def _average_rate(total: int, elapsed: float) -> float:
+    """Return the cumulative per-second rate, which is never spuriously zero."""
+    if elapsed <= 0:
+        return 0.0
+    return max(0.0, total) / elapsed
+
+
+def _format_eta(seconds: float | None) -> str:
+    if seconds is None or seconds < 0 or not math.isfinite(seconds):
+        return "--:--:--"
+    return _format_hms(seconds)
 
 
 def _render_dashboard(
@@ -496,10 +614,24 @@ def _render_dashboard(
     gpu_cap: str,
     concurrency: int,
     pending: int,
-    rate: float,
+    decoded_tokens: float,
+    window_rate: float,
     character_target: int,
 ) -> Group:
-    elapsed = _format_hms(time.monotonic() - state.started_at)
+    elapsed = time.monotonic() - state.started_at
+    elapsed_text = _format_hms(elapsed)
+    committed = snapshot.total_characters_written
+    # Tokens the server has decoded but that are not yet on disk, used only to
+    # keep the character-based readings from lagging behind real progress.
+    pending_tokens = max(0.0, decoded_tokens - snapshot.output_tokens_appended)
+    live_chars = committed + _estimate_characters(
+        pending_tokens, snapshot.output_tokens_appended, committed
+    )
+    avg_chars_rate = _average_rate(live_chars, elapsed)
+    avg_token_rate = _average_rate(decoded_tokens, elapsed)
+    remaining = state.remaining_characters()
+    eta = remaining / avg_chars_rate if avg_chars_rate > 0 and remaining > 0 else None
+
     header_rows = [
         Text("Synthetic pretraining generation", style="bold"),
         Text(
@@ -520,34 +652,72 @@ def _render_dashboard(
         )
     header_rows.append(Text(""))
     header = Group(*header_rows)
-    table = Table(box=None, show_header=False, padding=(0, 0))
+    table = Table(box=None, show_header=False, padding=(0, 2))
     table.add_column("", no_wrap=True)
     table.add_column("", justify="right", no_wrap=True)
     table.add_column("")
-    table.add_row("Output tokens appended:", f"{snapshot.output_tokens_appended:,}", "")
-    table.add_row("Characters generated:", f"{snapshot.generated_characters_appended:,}", f"/ {character_target:,}")
+    table.add_row("Sequences completed:", f"{state.sequences_completed:,}", "this run")
+    table.add_row(
+        "Topics completed:",
+        f"{state.resumed_topics + state.sequences_completed:,}",
+        "all runs",
+    )
+    table.add_row(
+        "Output tokens appended:", f"{snapshot.output_tokens_appended:,}", ""
+    )
+    table.add_row(
+        "Tokens decoded:", f"{decoded_tokens:,.0f}", "server total"
+    )
+    table.add_row("Characters generated:", f"{committed:,}", f"/ {character_target:,}")
     table.add_row("Documents appended:", f"{snapshot.documents_appended:,}", "")
     table.add_row("TXT shards created:", f"{snapshot.files_created:,}", "")
-    table.add_row("Aggregate output rate:", f"{rate:,.0f}", "tokens/sec (last 30 s)")
-    table.add_row("Elapsed:", elapsed, "")
+    table.add_row(
+        "Average rate:",
+        f"{avg_chars_rate:,.0f}",
+        f"chars/sec ({avg_token_rate:,.0f} tok/sec)",
+    )
+    table.add_row("Rate (last 30 s):", f"{window_rate:,.0f}", "tokens/sec")
+    table.add_row("ETA:", _format_eta(eta), "at average rate")
+    table.add_row("Elapsed:", elapsed_text, "")
     table.add_row("Status:", state.status, "")
     return Group(header, table)
+
+
+def _estimate_characters(
+    pending_tokens: float, committed_tokens: int, committed_characters: int
+) -> int:
+    """Project the characters in flight using the observed chars/token ratio.
+
+    The server reports in-flight work in tokens while the target is measured
+    in characters. Scaling by the ratio observed on committed documents keeps
+    the ETA honest without assuming a fixed characters-per-token value.
+    """
+    if pending_tokens <= 0 or committed_tokens <= 0:
+        return 0
+    return int(pending_tokens * committed_characters / committed_tokens)
 
 
 def _render_snapshot_line(
     state: _RunState,
     snapshot: WriteStats,
     pending: int,
-    rate: float,
+    decoded_tokens: float,
+    window_rate: float,
 ) -> str:
-    elapsed = _format_hms(time.monotonic() - state.started_at)
+    elapsed = time.monotonic() - state.started_at
+    committed = snapshot.total_characters_written
     return (
         f"round={state.round_number} in_flight={state.in_flight} "
         f"pending={pending} docs={snapshot.documents_appended} "
         f"files={snapshot.files_created} "
+        f"seqs={state.sequences_completed} "
+        f"topics={state.resumed_topics + state.sequences_completed} "
         f"tokens={snapshot.output_tokens_appended:,} "
-        f"chars={snapshot.total_characters_written:,} "
-        f"rate={rate:,.0f} tok/s elapsed={elapsed} status={state.status}"
+        f"decoded={decoded_tokens:,.0f} "
+        f"chars={committed:,} "
+        f"chars_per_sec={_average_rate(committed, elapsed):,.0f} "
+        f"rate={window_rate:,.0f} tok/s elapsed={_format_hms(elapsed)} "
+        f"status={state.status}"
     )
 
 
@@ -555,6 +725,7 @@ async def _dashboard(
     state: _RunState,
     writer: TextWriter,
     job_queue: asyncio.Queue,
+    inference: InferenceManager,
     model: str,
     gpu_cap: str,
     concurrency: int,
@@ -562,10 +733,22 @@ async def _dashboard(
 ) -> None:
     history: deque[tuple[float, int]] = deque()
     if console.is_terminal:
-        with Live(console=console, auto_refresh=False) as live:
-            while True:
-                snapshot = writer.snapshot()
-                _sample_rate(history, snapshot)
+        interval = _DASHBOARD_REFRESH_SECONDS
+    else:
+        interval = _NON_TTY_SNAPSHOT_SECONDS
+    is_terminal = console.is_terminal
+    with contextlib.ExitStack() as stack:
+        live = (
+            stack.enter_context(Live(console=console, auto_refresh=False))
+            if is_terminal
+            else None
+        )
+        while True:
+            snapshot = writer.snapshot()
+            decoded_tokens = await inference.sample_decoded_tokens()
+            _sample_rate(history, decoded_tokens)
+            window_rate = _window_rate(history, decoded_tokens)
+            if live is not None:
                 live.update(
                     _render_dashboard(
                         state,
@@ -574,24 +757,22 @@ async def _dashboard(
                         gpu_cap,
                         concurrency,
                         job_queue.qsize(),
-                        _window_rate(history, snapshot.output_tokens_appended),
+                        decoded_tokens,
+                        window_rate,
                         character_target,
                     )
                 )
-                await asyncio.sleep(_DASHBOARD_REFRESH_SECONDS)
-    else:
-        while True:
-            snapshot = writer.snapshot()
-            _sample_rate(history, snapshot)
-            console.print(
-                _render_snapshot_line(
-                    state,
-                    snapshot,
-                    job_queue.qsize(),
-                    _window_rate(history, snapshot.output_tokens_appended),
+            else:
+                console.print(
+                    _render_snapshot_line(
+                        state,
+                        snapshot,
+                        job_queue.qsize(),
+                        decoded_tokens,
+                        window_rate,
+                    )
                 )
-            )
-            await asyncio.sleep(_NON_TTY_SNAPSHOT_SECONDS)
+            await asyncio.sleep(interval)
 
 
 async def _run_pipeline(
@@ -605,11 +786,15 @@ async def _run_pipeline(
     checkpoint_path: Path | None = None,
 ) -> None:
     character_target = config["storage"]["characters_to_generate"]
+    # A bounded queue paces dispatch: the producer blocks on put until a worker
+    # frees a slot, so the backlog never runs far ahead of the requests that are
+    # actually in flight.
     queue_max = max(2, 2 * concurrency)
     job_queue: asyncio.Queue = asyncio.Queue(maxsize=queue_max)
     result_queue: asyncio.Queue = asyncio.Queue(maxsize=queue_max)
 
     state = _RunState()
+    state.character_target = character_target
     state.resumed_topics = len(checkpoint) if checkpoint is not None else 0
     state.resumed_files = (
         len(checkpoint.completed_per_file()) if checkpoint is not None else 0
@@ -639,6 +824,7 @@ async def _run_pipeline(
             state,
             writer,
             job_queue,
+            inference,
             config["model"],
             f"{config['inference']['max_gpu_memory_utilization']:.0%}",
             concurrency,
@@ -685,17 +871,31 @@ def _print_final_summary(
     config: dict, state: _RunState, writer: TextWriter
 ) -> None:
     snapshot = writer.snapshot()
+    elapsed = max(0.0, time.monotonic() - state.started_at)
+    committed = snapshot.total_characters_written
     console.print("[bold]Generation finished[/bold]")
     console.print(f"  Status:                   {state.status}")
+    console.print(
+        f"  Sequences completed:      {state.sequences_completed:,}"
+    )
+    console.print(
+        f"  Topics completed:         "
+        f"{state.resumed_topics + state.sequences_completed:,} (all runs)"
+    )
     console.print(
         f"  Output tokens appended:   {snapshot.output_tokens_appended:,}"
     )
     console.print(
-        f"  Characters generated:     {snapshot.generated_characters_appended:,} "
+        f"  Characters generated:     {committed:,} "
         f"/ {config['storage']['characters_to_generate']:,}"
     )
     console.print(f"  Documents appended:       {snapshot.documents_appended:,}")
     console.print(f"  TXT shards created:       {snapshot.files_created:,}")
+    console.print(
+        f"  Average rate:             "
+        f"{_average_rate(committed, elapsed):,.0f} chars/sec"
+    )
+    console.print(f"  Elapsed:                  {_format_hms(elapsed)}")
 
 
 def _next_pending_round(rounds: Iterator[list[Job]]) -> list[Job] | None:

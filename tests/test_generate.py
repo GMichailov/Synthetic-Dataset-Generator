@@ -1,9 +1,12 @@
 import asyncio
 import json
+import time
+from collections import deque
 from copy import deepcopy
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
 from src.pretraining import generate as gen
 from src.pretraining import nvidia_generation as ng
@@ -70,6 +73,8 @@ class FakeInference:
         self.delay = 0.0
         self.fail_counts = {}
         self.empty_prompts = set()
+        self.decoded_tokens = 0.0
+        self.doc_chars = 0
         self._doc_counter = 0
         FakeInference.instances.append(self)
 
@@ -105,11 +110,17 @@ class FakeInference:
             return "", 0
         self._doc_counter += 1
         topic = prompt.split("explaining ", 1)[-1].split(" to me as if", 1)[0]
-        return f"Paper {self._doc_counter} concerning {topic}.", self.tokens_per_doc
+        text = f"Paper {self._doc_counter} concerning {topic}."
+        if self.doc_chars:
+            text = text.ljust(self.doc_chars, "x")
+        return text, self.tokens_per_doc
 
     async def shutdown(self):
         self.shut_down = True
         self.events.append(("shutdown",))
+
+    async def sample_decoded_tokens(self):
+        return self.decoded_tokens
 
 
 @pytest.fixture(autouse=True)
@@ -723,3 +734,226 @@ class TestResume:
         # benchmark with nothing to measure against.
         assert len(sampled) == 1
         assert sampled[0]
+
+
+class TestCharacterBudget:
+    """The character target must bound the total instead of being overrun.
+
+    Reproduces the shape of the real run: many documents, each large relative
+    to the target, generated at a concurrency far above the number of
+    documents the target actually needs. Without budget-aware dispatch the
+    already-dispatched tail all lands after the target trips.
+    """
+
+    TARGET = 300_000
+    DOC_CHARS = 10_765
+    CONCURRENCY = 32
+
+    @pytest.fixture(autouse=True)
+    def realistic_fake(self, monkeypatch):
+        """Force 32-way concurrency and documents of a realistic size."""
+        original_init = FakeInference.__init__
+        doc_chars = self.DOC_CHARS
+        concurrency = self.CONCURRENCY
+
+        def patched_init(self, config):
+            original_init(self, config)
+            self.doc_chars = doc_chars
+
+        async def fake_benchmark(self, prompts, max_concurrency, on_progress=None):
+            return [BenchmarkMeasurement(concurrency, 600.0, 64, 38_400, 64.0, 38_400)]
+
+        monkeypatch.setattr(FakeInference, "__init__", patched_init)
+        monkeypatch.setattr(FakeInference, "benchmark", fake_benchmark)
+
+    def _write_topics(self, prompt_dir, count=600):
+        write_prompt_file(
+            prompt_dir, "a.txt", "\n".join(["Head"] + [f"Topic{i}" for i in range(count)])
+        )
+
+    def test_overshoot_is_bounded(self, patch_environment):
+        prompt_dir, output_dir, install = patch_environment
+        self._write_topics(prompt_dir)
+        config = install(make_config(**{"storage.characters_to_generate": self.TARGET}))
+
+        run_sync(config)
+
+        shards = sorted(output_dir.glob("*.txt"))
+        total = sum(len(path.read_text(encoding="utf-8")) for path in shards)
+        generated = sum(
+            1 for event in FakeInference.instances[0].events if event[0] == "generate"
+        )
+
+        # The target needs ~28 documents. Everything dispatched before the
+        # projection trips still drains, so one concurrency wave of slack is
+        # expected, but not the unbounded backlog that produced a 2x overrun.
+        assert total >= self.TARGET
+        assert total <= self.TARGET * 1.6, f"overshot to {total:,} chars"
+        assert generated <= self.TARGET // self.DOC_CHARS + self.CONCURRENCY
+
+    def test_backlog_stays_bounded(self, patch_environment):
+        prompt_dir, output_dir, install = patch_environment
+        self._write_topics(prompt_dir)
+        config = install(make_config(**{"storage.characters_to_generate": self.TARGET}))
+
+        seen = []
+        original = gen._producer
+
+        async def recording_producer(*args, **kwargs):
+            task = asyncio.create_task(original(*args, **kwargs))
+            while not task.done():
+                queue = args[2]
+                seen.append(queue.qsize())
+                await asyncio.sleep(0)
+            return await task
+
+        gen._producer = recording_producer
+        try:
+            run_sync(config)
+        finally:
+            gen._producer = original
+
+        assert seen, "producer never ran"
+        # The bounded queue is what paces dispatch; the backlog must not grow
+        # without limit regardless of how many topics remain.
+        assert max(seen) <= max(2, 2 * self.CONCURRENCY)
+
+    def test_unmeasured_budget_does_not_stop_the_run(self, patch_environment):
+        prompt_dir, output_dir, install = patch_environment
+        self._write_topics(prompt_dir, count=6)
+        # A target smaller than a single document must still write something
+        # rather than stopping before any mean can be measured.
+        config = install(make_config(**{"storage.characters_to_generate": 5}))
+
+        run_sync(config)
+
+        shards = sorted(output_dir.glob("*.txt"))
+        assert shards
+        assert "Paper " in shards[0].read_text(encoding="utf-8")
+
+
+class TestRateReporting:
+    """A throughput reading must reflect real progress, not idle polls."""
+
+    def test_window_rate_uses_live_samples(self):
+        history = deque()
+        now = time.monotonic()
+        # Samples spread across the window, tokens advancing continuously the
+        # way in-flight decoding does, rather than in one big step at the end.
+        for offset, tokens in ((-30.0, 0), (-20.0, 200), (-10.0, 400)):
+            history.append((now + offset, tokens))
+
+        rate = gen._window_rate(history, 600)
+        assert rate == pytest.approx(20.0, rel=0.35)
+
+    def test_window_rate_is_zero_without_movement(self):
+        history = deque()
+        now = time.monotonic()
+        for offset in (-10.0, -5.0):
+            history.append((now + offset, 500))
+
+        assert gen._window_rate(history, 500) == 0.0
+
+    def test_window_rate_needs_two_samples(self):
+        assert gen._window_rate(deque([(time.monotonic(), 10)]), 20) == 0.0
+        assert gen._window_rate(deque(), 20) == 0.0
+
+    def test_stale_samples_are_evicted(self):
+        history = deque()
+        now = time.monotonic()
+        for offset in (-120.0, -90.0, (-gen._RATE_WINDOW_SECONDS) - 5.0):
+            history.append((now + offset, 0))
+
+        gen._sample_rate(history, 42)
+
+        assert len(history) == 1
+        assert history[-1][1] == 42
+
+    def test_average_rate_never_reports_zero_for_real_output(self):
+        assert gen._average_rate(1000, 4.0) == pytest.approx(250.0)
+        assert gen._average_rate(1000, 0.0) == 0.0
+        assert gen._average_rate(0, 10.0) == 0.0
+
+    def test_eta_formats_unknown_rates(self):
+        assert gen._format_eta(None) == "--:--:--"
+        assert gen._format_eta(float("inf")) == "--:--:--"
+        assert gen._format_eta(3661) == "01:01:01"
+
+
+def _render_to_text(renderable):
+    """Render a Rich renderable to plain text at a fixed width."""
+    console = Console(width=200, record=True, force_terminal=False, no_color=True)
+    console.print(renderable)
+    return console.export_text()
+
+
+class TestDashboardOutput:
+    def _state(self, **kwargs):
+        state = gen._RunState()
+        state.character_target = 300_000
+        for key, value in kwargs.items():
+            setattr(state, key, value)
+        return state
+
+    def _snapshot(self, tokens, characters, documents, files):
+        return gen.WriteStats(
+            documents_appended=documents,
+            output_tokens_appended=tokens,
+            generated_characters_appended=characters,
+            total_characters_written=characters,
+            files_created=files,
+        )
+
+    def test_dashboard_reports_sequences_and_rates(self):
+        state = self._state(
+            committed_characters=120_000,
+            sequences_completed=11,
+            resumed_topics=40,
+        )
+        text = _render_to_text(
+            gen._render_dashboard(
+                state,
+                self._snapshot(30_000, 120_000, 11, 1),
+                "model.gguf",
+                "90%",
+                32,
+                3,
+                4_200,
+                500.0,
+                300_000,
+            )
+        )
+        assert "Sequences completed:" in text
+        assert "Topics completed:" in text
+        assert "Tokens decoded:" in text
+        assert "Average rate:" in text
+        assert "Rate (last 30 s):" in text
+        assert "ETA:" in text
+        assert "40" in text and "11" in text
+
+    def test_snapshot_line_and_box_report_the_same_characters(self):
+        state = self._state(committed_characters=9_000, sequences_completed=2)
+        # Separators make the on-disk total differ from the raw generated sum.
+        snapshot = gen.WriteStats(
+            documents_appended=2,
+            output_tokens_appended=1_000,
+            generated_characters_appended=9_000,
+            total_characters_written=9_004,
+            files_created=1,
+        )
+
+        box = _render_to_text(
+            gen._render_dashboard(
+                state, snapshot, "m", "90%", 4, 0, 0, 10.0, 300_000
+            )
+        )
+        line = gen._render_snapshot_line(state, snapshot, 0, 0, 10.0)
+
+        assert "9,004" in box
+        assert "chars=9,004" in line
+
+    def test_estimate_characters_scales_by_observed_ratio(self):
+        # 2000 characters over 100 tokens committed, 50 tokens in flight.
+        assert gen._estimate_characters(50, 100, 2000) == 1000
+        assert gen._estimate_characters(0, 100, 2000) == 0
+        assert gen._estimate_characters(50, 0, 2000) == 0

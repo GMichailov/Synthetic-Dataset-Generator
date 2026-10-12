@@ -32,6 +32,8 @@ _THINK_END = "</" + "think" + ">"
 _MIN_ELAPSED_SECONDS = 1e-9
 _HEALTH_TIMEOUT_SECONDS = 300.0
 _HEALTH_POLL_MAX_DELAY = 0.5
+_METRICS_TIMEOUT_SECONDS = 2.0
+_DECODED_TOKENS_METRIC = "llamacpp:n_decode_total"
 _SHUTDOWN_GRACE_SECONDS = 10.0
 _STDERR_TAIL_LINES = 50
 
@@ -202,6 +204,44 @@ def _extract_message_text(message) -> str:
     return _strip_reasoning(content)
 
 
+def _parse_counter(body, metric_name: str) -> float:
+    """Read one Prometheus gauge/counter value out of a metrics exposition.
+
+    The body is line oriented ``name value`` pairs, with optional HELP and
+    TYPE comment lines and an optional trailing label set. Returns 0.0 when
+    the metric is absent or its value cannot be read, so a build that renames
+    or drops a metric degrades to "no live progress" instead of failing.
+    """
+    if not isinstance(body, str):
+        return 0.0
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if not line.startswith(metric_name):
+            continue
+        remainder = line[len(metric_name):]
+        # The name must end here; a longer metric sharing this prefix, such as
+        # "<name>_extra", is a different series and must be skipped.
+        if remainder and remainder[0] not in " \t{":
+            continue
+        # Skip the label set, if any, then read the bare value.
+        if remainder.startswith("{"):
+            closing = remainder.find("}")
+            if closing == -1:
+                continue
+            remainder = remainder[closing + 1:]
+        remainder = remainder.strip()
+        if not remainder:
+            continue
+        value_token = remainder.split()[0]
+        try:
+            return float(value_token)
+        except ValueError:
+            continue
+    return 0.0
+
+
 class _BenchmarkProgress:
     """Counts completed benchmark requests and reports to an optional callback.
 
@@ -340,6 +380,39 @@ class InferenceManager:
         semaphore = self._ensure_started()
         async with semaphore:
             return await self._run_request(prompt)
+
+    async def sample_decoded_tokens(self) -> float:
+        """Return the server's cumulative count of decoded output tokens.
+
+        A document's size only becomes known once its whole request completes,
+        which for long generations is minutes, so a throughput reading derived
+        only from completed documents reads zero almost all the time. The
+        Prometheus endpoint exposes ``llamacpp:n_decode_total``, a monotone
+        counter that advances for every token the model decodes, including
+        tokens of requests still in flight, which supplies the missing
+        progress.
+
+        Returns 0.0 whenever the count cannot be determined: the endpoint is
+        disabled, the server is busy, or the payload shape is unfamiliar.
+        Progress reporting must never be able to fail a generation run.
+        """
+        if self._session is None or self._server is None:
+            return 0.0
+        if self._server.poll() is not None:
+            return 0.0
+        try:
+            import aiohttp
+
+            async with self._session.get(
+                f"{self._base_url}/metrics",
+                timeout=aiohttp.ClientTimeout(total=_METRICS_TIMEOUT_SECONDS),
+            ) as response:
+                if response.status != 200:
+                    return 0.0
+                body = await response.text()
+        except Exception:  # noqa: BLE001 - progress sampling is best effort
+            return 0.0
+        return _parse_counter(body, _DECODED_TOKENS_METRIC)
 
     async def shutdown(self) -> None:
         if self._closed:

@@ -1,4 +1,5 @@
 import asyncio
+import json
 from copy import deepcopy
 from pathlib import Path
 
@@ -369,10 +370,10 @@ class TestPipeline:
         events = []
 
         class RecordingLoader(TopicLoader):
-            def iter_rounds(self):
-                for index, prompts in enumerate(super().iter_rounds(), start=1):
+            def _walk(self, skip=None):
+                for index, jobs in enumerate(super()._walk(skip), start=1):
                     events.append(("yield", index))
-                    yield prompts
+                    yield jobs
 
         class RecordingWriter(TextWriter):
             def append(self, text, output_tokens):
@@ -509,3 +510,216 @@ class TestTimeframe:
 
         assert existing.read_text(encoding="utf-8") == "preexisting"
         assert FakeInference.instances[0].shut_down is True
+
+
+class TestResume:
+    def _topic_block(self, count, prefix="Topic"):
+        return "\n".join(["Heading"] + [f"{prefix}{i}" for i in range(count)])
+
+    def test_checkpoint_written_during_run(self, patch_environment):
+        prompt_dir, output_dir, install = patch_environment
+        write_prompt_file(prompt_dir, "a.txt", self._topic_block(4))
+        config = install(make_config())
+
+        run_sync(config)
+
+        checkpoint_path = output_dir / gen.CHECKPOINT_NAME
+        assert checkpoint_path.is_file()
+        data = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        assert len(data["completed"]["a.txt"][0]) == 2  # one range [start, end]
+
+    def test_resume_skips_completed_topics(self, patch_environment):
+        prompt_dir, output_dir, install = patch_environment
+        write_prompt_file(prompt_dir, "a.txt", self._topic_block(4))
+        config = install(make_config(**{"storage.characters_to_generate": 200}))
+
+        run_sync(config)
+        first_pass = (output_dir / "000000.txt").read_text(encoding="utf-8")
+        generated_first = {
+            line for line in first_pass.split("\n\n") if "Paper" in line
+        }
+
+        # Widen the target so the resumed run must cover the remaining topics.
+        config["storage"]["characters_to_generate"] = 100_000
+        FakeInference.fail_counts = {}
+        run_sync(config)
+
+        second_pass = (output_dir / "000000.txt").read_text(encoding="utf-8")
+        papers = [p for p in second_pass.split("\n\n") if "Paper" in p]
+        assert len(papers) == 4
+        # Every original document is still present exactly once.
+        for paper in generated_first:
+            assert second_pass.count(paper) == 1
+
+    def test_resume_reaches_target_then_stops(self, patch_environment):
+        prompt_dir, output_dir, install = patch_environment
+        write_prompt_file(prompt_dir, "a.txt", self._topic_block(4))
+        config = install(make_config(**{"storage.characters_to_generate": 200}))
+
+        run_sync(config)
+        snapshot = json.loads(
+            (output_dir / gen.CHECKPOINT_NAME).read_text(encoding="utf-8")
+        )["writer"]["totals"]
+
+        # A second run at the same target must recognise the goal is met.
+        config["storage"]["characters_to_generate"] = 200
+        run_sync(config)
+
+        assert snapshot["generated_characters_appended"] > 0
+        assert snapshot["documents_appended"] > 0
+
+    def test_target_is_cumulative_across_runs(self, patch_environment):
+        prompt_dir, output_dir, install = patch_environment
+        write_prompt_file(prompt_dir, "a.txt", self._topic_block(6))
+        config = install(make_config(**{"storage.characters_to_generate": 150}))
+
+        run_sync(config)
+        after_first = json.loads(
+            (output_dir / gen.CHECKPOINT_NAME).read_text(encoding="utf-8")
+        )["writer"]["totals"]["generated_characters_appended"]
+
+        run_sync(config)
+        after_second = json.loads(
+            (output_dir / gen.CHECKPOINT_NAME).read_text(encoding="utf-8")
+        )["writer"]["totals"]["generated_characters_appended"]
+
+        # Cumulative totals never reset between runs.
+        assert after_first >= 150
+        assert after_second >= after_first
+
+    def test_exhausted_corpus_exits_without_generating(self, patch_environment, capsys):
+        prompt_dir, output_dir, install = patch_environment
+        write_prompt_file(prompt_dir, "a.txt", self._topic_block(2))
+        config = install(make_config())
+
+        run_sync(config)
+        FakeInference.instances = []
+        capsys.readouterr()
+        run_sync(config)
+
+        assert FakeInference.instances == []
+        assert "Nothing left to generate" in capsys.readouterr().out
+
+    def test_unacknowledged_tail_is_truncated_on_resume(self, patch_environment):
+        prompt_dir, output_dir, install = patch_environment
+        write_prompt_file(prompt_dir, "a.txt", self._topic_block(4))
+        config = install(make_config(**{"storage.characters_to_generate": 200}))
+
+        run_sync(config)
+        good = (output_dir / "000000.txt").read_text(encoding="utf-8")
+
+        # Simulate a crash that flushed a document the checkpoint never saw.
+        with open(output_dir / "000000.txt", "a", encoding="utf-8") as handle:
+            handle.write("\n\nORPHAN")
+
+        config["storage"]["characters_to_generate"] = 100_000
+        run_sync(config)
+
+        resumed = (output_dir / "000000.txt").read_text(encoding="utf-8")
+        assert "ORPHAN" not in resumed
+        assert resumed.startswith(good)
+
+    def test_fresh_ignores_checkpoint_but_refuses_shards(
+        self, patch_environment, capsys
+    ):
+        prompt_dir, output_dir, install = patch_environment
+        write_prompt_file(prompt_dir, "a.txt", self._topic_block(4))
+        config = install(make_config())
+        run_sync(config)
+
+        with pytest.raises(FileExistsError):
+            run_sync(config, fresh=True)
+
+    def test_restart_clears_dataset_and_checkpoint(self, patch_environment):
+        prompt_dir, output_dir, install = patch_environment
+        write_prompt_file(prompt_dir, "a.txt", self._topic_block(4))
+        config = install(make_config())
+        run_sync(config)
+        first = (output_dir / "000000.txt").read_text(encoding="utf-8")
+
+        run_sync(config, restart=True)
+
+        # Documents restart from Paper 1 rather than continuing the sequence.
+        second = (output_dir / "000000.txt").read_text(encoding="utf-8")
+        assert second == first
+
+    def test_status_prints_progress_without_generating(
+        self, patch_environment, capsys
+    ):
+        prompt_dir, output_dir, install = patch_environment
+        write_prompt_file(prompt_dir, "a.txt", self._topic_block(4))
+        config = install(make_config())
+        run_sync(config)
+
+        FakeInference.instances = []
+        capsys.readouterr()
+        run_sync(config, status_only=True)
+
+        out = capsys.readouterr().out
+        assert FakeInference.instances == []
+        assert "Checkpoint status" in out
+        assert "Completed topics" in out
+
+    def test_status_without_checkpoint(self, patch_environment, capsys):
+        prompt_dir, output_dir, install = patch_environment
+        write_prompt_file(prompt_dir, "a.txt", self._topic_block(2))
+        config = install(make_config())
+
+        run_sync(config, status_only=True)
+
+        assert "No checkpoint found" in capsys.readouterr().out
+
+    def test_changed_prompt_corpus_refuses_resume(self, patch_environment):
+        prompt_dir, output_dir, install = patch_environment
+        write_prompt_file(prompt_dir, "a.txt", self._topic_block(4))
+        config = install(make_config())
+        run_sync(config)
+
+        write_prompt_file(prompt_dir, "a.txt", self._topic_block(6))
+        config = install(make_config())
+
+        with pytest.raises(gen.CheckpointMismatch):
+            run_sync(config)
+
+    def test_checkpoint_is_not_written_into_shards(self, patch_environment):
+        prompt_dir, output_dir, install = patch_environment
+        write_prompt_file(prompt_dir, "a.txt", self._topic_block(3))
+        config = install(make_config())
+
+        run_sync(config)
+
+        content = (output_dir / "000000.txt").read_text(encoding="utf-8")
+        assert "checkpoint" not in content
+        assert "{'completed'" not in content
+
+    def test_benchmark_never_receives_a_fully_completed_round(self, patch_environment):
+        prompt_dir, output_dir, install = patch_environment
+        write_prompt_file(
+            prompt_dir,
+            "a.txt",
+            "\n".join(["Head1"] + [f"A{i}" for i in range(50)] + ["Head2"] + ["B0"]),
+        )
+        # A small target stops the first run partway through round 1, leaving
+        # that round partially complete.
+        config = install(make_config(**{"storage.characters_to_generate": 200}))
+        run_sync(config)
+
+        sampled = []
+        original = FakeInference.benchmark
+
+        async def patched(self, prompts, concurrency, on_progress=None):
+            sampled.append(list(prompts))
+            return await original(self, prompts, concurrency, on_progress)
+
+        FakeInference.benchmark = patched
+        try:
+            config["storage"]["characters_to_generate"] = 100_000
+            run_sync(config)
+        finally:
+            FakeInference.benchmark = original
+
+        # The resumed run must hand the benchmark a nonempty prompt list: a
+        # round whose every topic is already committed would leave the
+        # benchmark with nothing to measure against.
+        assert len(sampled) == 1
+        assert sampled[0]

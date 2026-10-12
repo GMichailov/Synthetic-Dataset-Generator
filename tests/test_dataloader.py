@@ -1,6 +1,8 @@
+from pathlib import Path
+
 import pytest
 
-from src.pretraining.dataloader import TopicLoader
+from src.pretraining.dataloader import TopicId, TopicLoader
 
 
 def _write_prompts_dir(tmp_path, files: dict[str, str]) -> str:
@@ -289,3 +291,123 @@ class TestTopicLoader:
 
         assert len(rounds) == 1
         assert len(rounds[0]) == 50
+
+
+def _block(prefix, count):
+    return "\n".join([f"Head{prefix}"] + [f"{prefix}{i}" for i in range(count)])
+
+
+class TestTopicIdentity:
+    def test_ordinals_are_per_file_and_sequential(self, tmp_path):
+        content = "Heading\nT0\nT1\nT2\n"
+        prompt_dir = _write_prompts_dir(tmp_path, {"a.txt": content, "b.txt": content})
+        loader = TopicLoader(prompt_dir)
+
+        jobs = [job for round_ in loader.iter_jobs() for job in round_]
+
+        by_file = {}
+        for job in jobs:
+            by_file.setdefault(job.topic_id.file, []).append(job.topic_id.ordinal)
+        # Round order is shuffled, so compare the ordinal sets per file.
+        assert {name: sorted(o) for name, o in by_file.items()} == {
+            "a.txt": [0, 1, 2],
+            "b.txt": [0, 1, 2],
+        }
+
+    def test_duplicate_topic_text_gets_distinct_ids(self, tmp_path):
+        prompt_dir = _write_prompts_dir(tmp_path, {"a.txt": "Heading\nSame\nSame\n"})
+        loader = TopicLoader(prompt_dir)
+
+        jobs = next(loader.iter_jobs())
+
+        assert len({job.topic_id for job in jobs}) == 2
+        assert {job.prompt for job in jobs} == {jobs[0].prompt}
+
+    def test_ordinals_continue_across_blocks(self, tmp_path):
+        content = f"{_block('A', 50)}\n{_block('B', 3)}\n"
+        prompt_dir = _write_prompts_dir(tmp_path, {"a.txt": content})
+        loader = TopicLoader(prompt_dir)
+
+        jobs = [job for round_ in loader.iter_jobs() for job in round_]
+
+        assert [job.topic_id.ordinal for job in sorted(jobs, key=lambda j: j.topic_id.ordinal)] == list(range(53))
+
+    def test_fingerprint_reports_every_file(self, tmp_path):
+        prompt_dir = _write_prompts_dir(tmp_path, {"a.txt": "H\nT\n", "b.txt": "H\nT\n"})
+        loader = TopicLoader(prompt_dir)
+
+        fingerprint = loader.fingerprint()
+
+        assert [name for name, _, _ in fingerprint] == ["a.txt", "b.txt"]
+
+    def test_fingerprint_changes_when_file_changes(self, tmp_path):
+        prompt_dir = _write_prompts_dir(tmp_path, {"a.txt": "H\nT\n"})
+        before = TopicLoader(prompt_dir).fingerprint()
+        Path(prompt_dir, "a.txt").write_text("H\nT\nMore\n", encoding="utf-8")
+
+        assert TopicLoader(prompt_dir).fingerprint() != before
+
+
+class TestResumeSkipping:
+    def test_skip_none_matches_iter_rounds(self, tmp_path):
+        prompt_dir = _write_prompts_dir(
+            tmp_path, {"a.txt": f"{_block('A', 50)}\n{_block('B', 4)}\n"}
+        )
+        loader = TopicLoader(prompt_dir)
+
+        rounds = list(loader.iter_rounds())
+        job_rounds = [
+            [job.prompt for job in round_] for round_ in loader.iter_jobs()
+        ]
+
+        assert rounds == job_rounds
+
+    def test_completed_topics_are_omitted(self, tmp_path):
+        prompt_dir = _write_prompts_dir(tmp_path, {"a.txt": "Heading\nT0\nT1\nT2\n"})
+        loader = TopicLoader(prompt_dir)
+
+        jobs = next(loader.iter_jobs(skip=lambda tid: tid.ordinal < 2))
+
+        assert [job.topic_id.ordinal for job in jobs] == [2]
+
+    def test_fully_completed_corpus_yields_no_rounds(self, tmp_path):
+        prompt_dir = _write_prompts_dir(tmp_path, {"a.txt": "Heading\nT0\nT1\n"})
+        loader = TopicLoader(prompt_dir)
+
+        rounds = list(loader.iter_jobs(skip=lambda tid: True))
+
+        assert rounds == []
+
+    def test_resume_preserves_round_composition(self, tmp_path):
+        files = {
+            "a.txt": f"{_block('A', 50)}\n{_block('A2', 10)}\n",
+            "b.txt": f"{_block('B', 50)}\n{_block('B2', 10)}\n",
+        }
+        prompt_dir = _write_prompts_dir(tmp_path, files)
+        loader = TopicLoader(prompt_dir)
+
+        full = [[job.topic_id for job in r] for r in loader.iter_jobs()]
+
+        # Simulate finishing every topic of round 1 plus two of round 2.
+        skip = {tid for round_ in full[:1] for tid in round_}
+        skip |= set(full[1][:2])
+        resumed = [
+            [job.topic_id for job in r] for r in loader.iter_jobs(skip=skip.__contains__)
+        ]
+
+        # The fully completed round 1 produces no work; round 2 is the first
+        # yielded round and carries only its ungenerated topics.
+        assert len(resumed) == len(full) - 1
+        assert set(resumed[0]) == set(full[1]) - skip
+
+    def test_partial_skip_never_repeats_prompt(self, tmp_path):
+        prompt_dir = _write_prompts_dir(tmp_path, {"a.txt": "Heading\nT0\nT1\nT2\n"})
+        loader = TopicLoader(prompt_dir)
+
+        all_jobs = [job for round_ in loader.iter_jobs() for job in round_]
+        seen = {job.topic_id: job.prompt for job in all_jobs}
+
+        skip = {TopicId("a.txt", 0), TopicId("a.txt", 2)}
+        remaining = next(loader.iter_jobs(skip=skip.__contains__))
+
+        assert [job.prompt for job in remaining] == [seen[TopicId("a.txt", 1)]]

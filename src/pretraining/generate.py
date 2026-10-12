@@ -27,7 +27,13 @@ from rich.progress import (
 from rich.table import Table
 from rich.text import Text
 
-from .dataloader import TopicLoader
+from .checkpoint import (
+    CHECKPOINT_NAME,
+    Checkpoint,
+    CheckpointMismatch,
+    load_checkpoint,
+)
+from .dataloader import Job, TopicId, TopicLoader
 from .inference import BenchmarkMeasurement, InferenceManager
 from .nvidia_generation import (
     CapacityReport,
@@ -63,6 +69,8 @@ class _RunState:
     interrupted: bool = False
     started_at: float = field(default_factory=time.monotonic)
     stop_event: asyncio.Event = field(default_factory=asyncio.Event)
+    resumed_topics: int = 0
+    resumed_files: int = 0
 
     def note_committed(self, characters: int, character_target: int) -> None:
         if characters >= character_target and not self.stop_event.is_set():
@@ -379,24 +387,25 @@ async def _worker(
     state: _RunState,
 ) -> None:
     while True:
-        prompt = await job_queue.get()
+        job = await job_queue.get()
         try:
-            if prompt is None:
+            if job is None:
                 return
             state.in_flight += 1
             try:
                 text, output_tokens = await _generate_with_retry(
-                    inference, prompt, worker_index
+                    inference, job.prompt, worker_index
                 )
             finally:
                 state.in_flight -= 1
             if not text or output_tokens <= 0:
                 logger.warning(
-                    "Worker %d received empty output; dropping this job",
+                    "Worker %d received empty output; dropping topic %s",
                     worker_index,
+                    job.topic_id,
                 )
                 continue
-            await result_queue.put((text, output_tokens))
+            await result_queue.put((job, text, output_tokens))
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - one bad prompt must not kill the run
@@ -410,14 +419,22 @@ async def _writer_consumer(
     writer: TextWriter,
     state: _RunState,
     character_target: int,
+    checkpoint: Checkpoint | None,
+    checkpoint_path: Path | None,
 ) -> None:
     while True:
         item = await result_queue.get()
         try:
             if item is None:
                 return
-            text, output_tokens = item
+            job, text, output_tokens = item
             writer.append(text, output_tokens)
+            # Mark complete only after the append succeeded, so a failure here
+            # leaves the topic to be regenerated rather than silently skipped.
+            if checkpoint is not None and checkpoint_path is not None:
+                checkpoint.mark_complete(job.topic_id)
+                checkpoint.record_writer(writer.resume_state())
+                checkpoint.save(checkpoint_path)
             snapshot = writer.snapshot()
             state.note_committed(
                 snapshot.generated_characters_appended,
@@ -428,8 +445,8 @@ async def _writer_consumer(
 
 
 async def _producer(
-    rounds: Iterator[list[str]],
-    first_round: list[str],
+    rounds: Iterator[list[Job]],
+    first_round: list[Job],
     job_queue: asyncio.Queue,
     result_queue: asyncio.Queue,
     state: _RunState,
@@ -439,10 +456,10 @@ async def _producer(
         if state.stop_event.is_set():
             return
         state.round_number += 1
-        for prompt in current:
+        for job in current:
             if state.stop_event.is_set():
                 break
-            await job_queue.put(prompt)
+            await job_queue.put(job)
         await job_queue.join()
         await result_queue.join()
         if state.stop_event.is_set():
@@ -483,7 +500,7 @@ def _render_dashboard(
     character_target: int,
 ) -> Group:
     elapsed = _format_hms(time.monotonic() - state.started_at)
-    header = Group(
+    header_rows = [
         Text("Synthetic pretraining generation", style="bold"),
         Text(
             f"Model: {model}        GPU memory cap: {gpu_cap}   "
@@ -493,8 +510,16 @@ def _render_dashboard(
             f"Round: {state.round_number}                   "
             f"In flight: {state.in_flight}        Pending: {pending}"
         ),
-        Text(""),
-    )
+    ]
+    if state.resumed_topics:
+        header_rows.append(
+            Text(
+                f"Resumed: {state.resumed_topics:,} topics already "
+                f"generated across {state.resumed_files} files"
+            )
+        )
+    header_rows.append(Text(""))
+    header = Group(*header_rows)
     table = Table(box=None, show_header=False, padding=(0, 0))
     table.add_column("", no_wrap=True)
     table.add_column("", justify="right", no_wrap=True)
@@ -571,11 +596,13 @@ async def _dashboard(
 
 async def _run_pipeline(
     config: dict,
-    rounds: Iterator[list[str]],
-    first_round: list[str],
+    rounds: Iterator[list[Job]],
+    first_round: list[Job],
     writer: TextWriter,
     inference: InferenceManager,
     concurrency: int,
+    checkpoint: Checkpoint | None = None,
+    checkpoint_path: Path | None = None,
 ) -> None:
     character_target = config["storage"]["characters_to_generate"]
     queue_max = max(2, 2 * concurrency)
@@ -583,6 +610,10 @@ async def _run_pipeline(
     result_queue: asyncio.Queue = asyncio.Queue(maxsize=queue_max)
 
     state = _RunState()
+    state.resumed_topics = len(checkpoint) if checkpoint is not None else 0
+    state.resumed_files = (
+        len(checkpoint.completed_per_file()) if checkpoint is not None else 0
+    )
     uninstall = _install_signal_handler(state)
 
     workers = [
@@ -593,7 +624,14 @@ async def _run_pipeline(
         for index in range(concurrency)
     ]
     writer_task = asyncio.create_task(
-        _writer_consumer(result_queue, writer, state, character_target),
+        _writer_consumer(
+            result_queue,
+            writer,
+            state,
+            character_target,
+            checkpoint,
+            checkpoint_path,
+        ),
         name="writer-consumer",
     )
     dashboard_task = asyncio.create_task(
@@ -633,6 +671,9 @@ async def _run_pipeline(
     finally:
         _cancel_all(all_tasks)
         await asyncio.gather(*all_tasks, return_exceptions=True)
+        if checkpoint is not None and checkpoint_path is not None:
+            checkpoint.record_writer(writer.resume_state())
+            checkpoint.save(checkpoint_path)
         _print_final_summary(config, state, writer)
         uninstall()
 
@@ -657,13 +698,118 @@ def _print_final_summary(
     console.print(f"  TXT shards created:       {snapshot.files_created:,}")
 
 
-async def run(config: dict, *, timeframe_only: bool = False) -> None:
+def _next_pending_round(rounds: Iterator[list[Job]]) -> list[Job] | None:
+    """Return the first round that still has at least one ungenerated topic.
+
+    On resume the leading rounds may be fully complete and filter down to
+    nothing. They must still be pulled, because the loader advances file
+    cursors round by round and an empty round is where that advance happens.
+    """
+    for jobs in rounds:
+        if jobs:
+            return jobs
+    return None
+
+
+def _clear_output_directory(storage_path: Path) -> None:
+    if not storage_path.is_dir():
+        return
+    for path in storage_path.iterdir():
+        if path.is_file() and (
+            path.name == CHECKPOINT_NAME
+            or (path.suffix == ".txt" and len(path.stem) == 6 and path.stem.isdigit())
+        ):
+            path.unlink()
+    console.print(f"Cleared existing dataset and checkpoint in {storage_path}")
+
+
+def _print_checkpoint_status(checkpoint: Checkpoint, config: dict) -> None:
+    per_file = checkpoint.completed_per_file()
+    totals = checkpoint.writer.totals
+    console.print("[bold]Checkpoint status[/bold]")
+    console.print(f"  Path:                    {config['storage']['path']}")
+    console.print(f"  Model:                   {checkpoint.model}")
+    console.print(f"  Completed topics:        {len(checkpoint):,}")
+    console.print(f"  Files touched:           {len(per_file)}")
+    console.print(f"  Documents appended:      {totals.documents_appended:,}")
+    console.print(f"  Characters generated:    {totals.generated_characters_appended:,}")
+    console.print(f"  Output tokens appended:  {totals.output_tokens_appended:,}")
+    console.print(f"  TXT shards created:      {totals.files_created:,}")
+    console.print(
+        f"  Target characters:       "
+        f"{config['storage']['characters_to_generate']:,}"
+    )
+    if per_file:
+        table = Table(title="Completed topics per prompt file")
+        table.add_column("Prompt file", justify="right")
+        table.add_column("Topics done", justify="right")
+        for name, count in per_file.items():
+            table.add_row(name, f"{count:,}")
+        console.print(table)
+
+
+async def run(
+    config: dict,
+    *,
+    timeframe_only: bool = False,
+    fresh: bool = False,
+    restart: bool = False,
+    status_only: bool = False,
+) -> None:
     _validate_config(config)
 
-    rounds = TopicLoader(_PROMPT_DIR).iter_rounds()
-    first_round = next(rounds, None)
-    if not first_round:
-        console.print("No prompts found in prompt files; nothing to generate.")
+    loader = TopicLoader(_PROMPT_DIR)
+    storage_path = Path(config["storage"]["path"])
+    checkpoint_path = storage_path / CHECKPOINT_NAME
+
+    if restart:
+        _clear_output_directory(storage_path)
+
+    checkpoint: Checkpoint | None = None
+    if not timeframe_only and not fresh:
+        checkpoint = load_checkpoint(
+            checkpoint_path,
+            model=config["model"],
+            fingerprint=loader.fingerprint(),
+        )
+
+    if status_only:
+        if checkpoint is None or not checkpoint.is_resumable:
+            console.print(
+                f"No checkpoint found at {checkpoint_path}; "
+                f"this dataset has no recorded progress."
+            )
+            return
+        _print_checkpoint_status(checkpoint, config)
+        return
+
+    rounds = loader.iter_jobs(
+        skip=checkpoint.is_complete if checkpoint is not None else None
+    )
+    first_round = _next_pending_round(rounds)
+    if first_round is None:
+        if checkpoint is not None and checkpoint.is_resumable:
+            # Adopt the directory even with no work left, so any bytes written
+            # after the last checkpoint are truncated away and later shards
+            # created past it are discarded.
+            if not timeframe_only:
+                exhausted_writer = TextWriter(
+                    config["storage"]["path"],
+                    config["storage"]["characters_per_file"],
+                )
+                exhausted_writer.open(checkpoint.writer)
+                exhausted_writer.close()
+            totals = checkpoint.writer.totals
+            console.print("[bold]Nothing left to generate[/bold]")
+            console.print(f"  Completed topics:        {len(checkpoint):,}")
+            console.print(f"  Documents appended:      {totals.documents_appended:,}")
+            console.print(
+                f"  Characters generated:    "
+                f"{totals.generated_characters_appended:,} / "
+                f"{config['storage']['characters_to_generate']:,}"
+            )
+        else:
+            console.print("No prompts found in prompt files; nothing to generate.")
         return
 
     writer: TextWriter | None = None
@@ -671,7 +817,8 @@ async def run(config: dict, *, timeframe_only: bool = False) -> None:
         writer = TextWriter(
             config["storage"]["path"], config["storage"]["characters_per_file"]
         )
-        writer.open()
+        resume_state = checkpoint.writer if checkpoint is not None else None
+        writer.open(resume_state)
 
     report = estimate_capacity(config)
     _print_capacity_summary(config, report)
@@ -692,7 +839,7 @@ async def run(config: dict, *, timeframe_only: bool = False) -> None:
                 bar.update(task, completed=completed, total=total, description=note)
 
             measurements = await inference.benchmark(
-                first_round,
+                [job.prompt for job in first_round],
                 report.estimated_concurrency,
                 on_progress=on_progress,
             )
@@ -706,7 +853,14 @@ async def run(config: dict, *, timeframe_only: bool = False) -> None:
             return
 
         await _run_pipeline(
-            config, rounds, first_round, writer, inference, selected
+            config,
+            rounds,
+            first_round,
+            writer,
+            inference,
+            selected,
+            checkpoint,
+            checkpoint_path,
         )
     finally:
         if writer is not None:
@@ -737,7 +891,35 @@ def main() -> None:
         help="port for the llama serve backend (default: inference.port from "
         "config, 8080)",
     )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="ignore any existing checkpoint and regenerate every topic from "
+        "the beginning; still refuses to overwrite existing output shards",
+    )
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="delete existing output shards and the checkpoint, then generate "
+        "the corpus from the beginning",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="print checkpoint progress (topics done per file, cumulative "
+        "totals) and exit without loading the model",
+    )
     args = parser.parse_args()
+
+    if args.fresh and args.restart:
+        print("--fresh and --restart are mutually exclusive", file=sys.stderr)
+        raise SystemExit(2)
+    if args.status and (args.fresh or args.restart):
+        print(
+            "--status cannot be combined with --fresh or --restart",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -758,9 +940,24 @@ def main() -> None:
         config["inference"]["port"] = args.port
 
     try:
-        asyncio.run(run(config, timeframe_only=args.timeframe))
+        asyncio.run(
+            run(
+                config,
+                timeframe_only=args.timeframe,
+                fresh=args.fresh,
+                restart=args.restart,
+                status_only=args.status,
+            )
+        )
+    except CheckpointMismatch as exc:
+        print(f"Cannot resume: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
     except _Interrupted:
-        print("Generation interrupted; committed output was preserved.", file=sys.stderr)
+        print(
+            "Generation interrupted; committed output was preserved. "
+            "Run the same command again to resume where it stopped.",
+            file=sys.stderr,
+        )
         raise SystemExit(130) from None
     except KeyboardInterrupt:
         raise SystemExit(130) from None
